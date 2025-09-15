@@ -283,10 +283,10 @@ elif page == "PAA Usage":
     st.write(f"Total with allowance: **{total_with_allowance_lb:,.4f} lb**")
 
 # =============================
-# Module: Anneal Temp Estimator (Hybrid with refined physics baseline)
+# Module: Anneal Temp Estimator (local monotonic fit + physics blend)
 # =============================
 elif page == "Anneal Temp Estimator":
-    st.title("Anneal Temperature Estimator (Hybrid)")
+    st.title("Anneal Temperature Estimator (Local + Monotonic + Physics Blend)")
 
     # Inputs (4 decimals for dimensions & speeds)
     c1, c2, c3 = st.columns(3)
@@ -297,24 +297,21 @@ elif page == "Anneal Temp Estimator":
     with c3:
         height_ft = num_input4("Annealer height (ft)", 14.0000, 1.0000, 1.0000)
 
-    with st.expander("Advanced (oxide kinetics & heat-up model)"):
-        # Oxide kinetics: x^2 = K0 * exp(-Ea/(R*T)) * t
+    with st.expander("Advanced (physics baseline)"):
+        # Parabolic oxidation baseline with heat-up lag
         x_um = num_input4("Target oxide thickness (µm)", 0.2000, 0.0500, 0.0200, 5.0000)
         k0 = st.number_input("Parabolic rate K0 (m²/s)", value=1e-10, step=1e-11, format="%.1e")
         ea_kj = num_input4("Activation energy Ea (kJ/mol)", 120.0000, 5.0000, 40.0000, 200.0000)
-        # Heat-up: radial diffusion time ~ d^2 / (π² α). Use alpha for copper and a tunable beta.
         alpha = num_input4("Thermal diffusivity α (m²/s)", 1.11e-4, 1e-5, 1e-5, 5e-4)  # copper ~1.11e-4
         beta = num_input4("Heat-up multiplier β (–)", 1.0000, 0.1000, 0.1000, 5.0000)
         T_ambient_F = num_input1("Ambient (°F)", 75.0, 1.0, -40.0, 200.0)
+        physics_weight = st.slider("Physics blend (out-of-range)", 0.0, 1.0, 0.30, 0.05)
 
     def physics_temp_required(d_in, speed, height, x_um, k0, ea_kj, alpha, beta, T_amb_F):
         dwell_s = (height / speed) * 60.0
-        # Heat-up lag based on radial diffusion time
         d_m = d_in * 0.0254
         t_heat = beta * (d_m**2) / (alpha * (math.pi**2))  # s
         t_eff = max(1e-3, dwell_s - t_heat)
-
-        # Solve parabolic oxidation for T
         x_m = x_um * 1e-6
         Ea = ea_kj * 1000.0
         denom = math.log(max(1e-30, (k0 * t_eff) / (x_m**2)))
@@ -322,92 +319,110 @@ elif page == "Anneal Temp Estimator":
             T_K = 1100.0
         else:
             T_K = (Ea / R_GAS) / denom
-        # do not predict below ambient + 50 °F physically
         T_F = (T_K - 273.15) * 9.0/5.0 + 32.0
         T_F = max(T_F, T_amb_F + 50.0)
-        return T_F, dwell_s, t_heat
+        return T_F, dwell_s
 
     # Physics baseline
-    T_phys_F, dwell_s, t_heat_s = physics_temp_required(
+    T_phys_F, dwell_s = physics_temp_required(
         diameter_in, speed_fpm, height_ft, x_um, k0, ea_kj, alpha, beta, T_ambient_F
     )
 
-    # Data-driven correction
+    # Load dataset
     csv_path = "annealing_dataset_clean.csv"
-    coef = None
-    mae = rmse = None
-    used_rows = None
-
-    if os.path.exists(csv_path):
+    if not os.path.exists(csv_path):
+        st.error(f"Dataset not found: {csv_path}. Add it to the repo.")
+    else:
         try:
-            hist = pd.read_csv(csv_path)
+            df = pd.read_csv(csv_path)
+        except Exception as e:
+            df = None
+            st.error(f"Could not read {csv_path}: {e}")
+
+        if df is not None:
+            # Normalize columns
             rename_map = {
                 "Wire Dia": "wire_dia", "Speed": "speed_fpm",
                 "Annealer Ht": "annealer_ht_ft", "Anneal T": "anneal_temp_f",
                 "wire_dia": "wire_dia", "speed_fpm": "speed_fpm",
                 "annealer_ht_ft": "annealer_ht_ft", "anneal_temp_f": "anneal_temp_f",
             }
-            hist = hist.rename(columns={k: v for k, v in rename_map.items() if k in hist.columns})
+            df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
             need = ["wire_dia", "speed_fpm", "annealer_ht_ft", "anneal_temp_f"]
-            if set(need).issubset(hist.columns):
-                hist = hist.dropna(subset=need)
-                hist = hist[(hist["wire_dia"] > 0) & (hist["speed_fpm"] > 0) & (hist["annealer_ht_ft"] > 0)]
-                hist["dwell_s"] = (hist["annealer_ht_ft"] / hist["speed_fpm"]) * 60.0
+            if not set(need).issubset(df.columns):
+                st.error(f"CSV must contain columns: {need}")
+            else:
+                df = df.dropna(subset=need)
+                df = df[(df["wire_dia"] > 0) & (df["speed_fpm"] > 0) & (df["annealer_ht_ft"] > 0)]
+                if len(df) < 3:
+                    st.error("Not enough rows to fit a local model. Add more historical runs.")
+                else:
+                    # Features
+                    df["dwell_s"] = (df["annealer_ht_ft"] / df["speed_fpm"]) * 60.0
+                    df["ln_d"] = np.log(df["wire_dia"])
+                    df["ln_dw"] = np.log(df["dwell_s"])
+                    y = df["anneal_temp_f"].values
 
-                # Physics baseline for each historical row with current advanced settings
-                def phys_row(row):
-                    tF, _, _ = physics_temp_required(
-                        row["wire_dia"], row["speed_fpm"], row["annealer_ht_ft"],
-                        x_um, k0, ea_kj, alpha, beta, T_ambient_F
+                    # Global slopes for minimal sensitivity
+                    Xg = np.column_stack([np.ones(len(df)), df["ln_d"].values, df["ln_dw"].values])
+                    cg, *_ = np.linalg.lstsq(Xg, y, rcond=None)
+                    b_min = max(5.0, cg[1])   # °F per ln(d)
+                    c_min = min(-5.0, cg[2])  # °F per ln(dwell)
+
+                    # Local neighborhood in log-space
+                    q = np.array([math.log(diameter_in), math.log(dwell_s)])
+                    Z = df[["ln_d", "ln_dw"]].values
+                    dist = np.linalg.norm(Z - q, axis=1)
+                    k = min(12, len(df))
+                    idx = np.argsort(dist)[:k]
+                    neigh = df.iloc[idx].copy()
+                    out_of_range = float(np.median(dist[idx])) > 0.5  # heuristic radius
+
+                    # Local linear fit: T ≈ a + b·ln(d) + c·ln(dwell)
+                    Xl = np.column_stack([np.ones(len(neigh)), neigh["ln_d"].values, neigh["ln_dw"].values])
+                    yl = neigh["anneal_temp_f"].values
+                    cl, *_ = np.linalg.lstsq(Xl, yl, rcond=None)  # [a, b, c]
+                    a, b, c = float(cl[0]), float(cl[1]), float(cl[2])
+
+                    # Monotonic guardrails (enforce trends)
+                    if b < 0:
+                        b = max(b_min, 5.0)
+                    else:
+                        b = max(b, 5.0 if np.isfinite(b_min) else b)
+                    if c > 0:
+                        c = min(c_min, -5.0)
+                    else:
+                        c = min(c, -5.0 if np.isfinite(c_min) else c)
+
+                    # Predict local + blend with physics
+                    ln_d = q[0]; ln_dw = q[1]
+                    T_local = a + b * ln_d + c * ln_dw
+                    blend = physics_weight if out_of_range else 0.15
+                    T_blend = (1.0 - blend) * T_local + blend * T_phys_F
+
+                    # Final sanity clip
+                    T_final = float(np.clip(T_blend, 600.0, 1200.0))
+
+                    st.subheader("Estimated anneal temperature")
+                    st.write(f"**{T_final:,.1f} °F**")
+                    st.caption(
+                        f"dwell: {dwell_s:.1f} s  |  local slopes: "
+                        f"d → +{b:.1f} °F/ln(in), dwell → {c:.1f} °F/ln(s)  "
+                        f"| physics: {T_phys_F:,.1f} °F  | blend={blend:.2f}"
                     )
-                    return tF
-                hist["T_phys_F"] = hist.apply(phys_row, axis=1)
 
-                # Hybrid linear correction: actual ≈ a + b*T_phys + c*ln(d) + d*ln(dwell)
-                X = np.column_stack([
-                    np.ones(len(hist)),
-                    hist["T_phys_F"].values,
-                    np.log(hist["wire_dia"].values),
-                    np.log(hist["dwell_s"].values),
-                ])
-                y = hist["anneal_temp_f"].values
-                coef, *_ = np.linalg.lstsq(X, y, rcond=None)
-                pred_hist = X @ coef
-                mae = float(np.mean(np.abs(pred_hist - y)))
-                rmse = float(np.sqrt(np.mean((pred_hist - y) ** 2)))
+                    # Show nearest history
+                    neigh["_dist"] = dist[idx]
+                    st.write("Closest historical runs:")
+                    st.dataframe(
+                        neigh.sort_values("_dist").head(6)[
+                            ["wire_dia","speed_fpm","annealer_ht_ft","dwell_s","anneal_temp_f","_dist"]
+                        ].rename(columns={
+                            "wire_dia":"dia (in)","speed_fpm":"speed (FPM)",
+                            "annealer_ht_ft":"height (ft)","dwell_s":"dwell (s)",
+                            "anneal_temp_f":"temp (°F)","_dist":"distance"
+                        })
+                    )
 
-                # Nearest rows for context
-                ln_d = math.log(max(diameter_in, 1e-6))
-                ln_dw = math.log(max(dwell_s, 1e-6))
-                hist["_dist"] = np.sqrt((np.log(hist["wire_dia"]) - ln_d)**2 + (np.log(hist["dwell_s"]) - ln_dw)**2)
-                used_rows = hist.sort_values("_dist").head(5)[
-                    ["wire_dia", "speed_fpm", "annealer_ht_ft", "dwell_s", "anneal_temp_f", "T_phys_F"]
-                ]
-        except Exception as e:
-            st.error(f"Could not read/fit dataset: {e}")
-
-    if coef is not None:
-        Xq = np.array([1.0, T_phys_F, math.log(max(diameter_in, 1e-6)), math.log(max(dwell_s, 1e-6))])
-        T_hybrid = float(Xq @ coef)
-        T_final = float(np.clip(T_hybrid, 600.0, 1200.0))
-        model_note = f"hybrid = a + b·T_phys + c·ln(d) + d·ln(dwell)  |  fit MAE {mae:.1f} °F, RMSE {rmse:.1f} °F"
-    else:
-        T_final = float(np.clip(T_phys_F, 600.0, 1200.0))
-        model_note = "physics only (no repo data)"
-
-    st.subheader("Estimated anneal temperature")
-    st.write(f"**{T_final:,.1f} °F**")
-    st.caption(
-        f"dwell: {dwell_s:.1f} s  |  physics baseline: {T_phys_F:,.1f} °F "
-        f"(heat-up {t_heat_s:.1f} s)  |  {model_note}"
-    )
-
-    if used_rows is not None:
-        st.write("Closest historical runs (for context):")
-        st.dataframe(
-            used_rows.rename(columns={
-                "wire_dia": "dia (in)", "speed_fpm": "speed (FPM)",
-                "annealer_ht_ft": "height (ft)", "dwell_s": "dwell (s)",
-                "anneal_temp_f": "actual (°F)", "T_phys_F": "physics (°F)"
-            })
-        )
+                    if out_of_range:
+                        st.warning("Inputs are outside the dense region of history. Increased physics blending applied.")
