@@ -50,6 +50,7 @@ def annulus_area_in2(id_in: float, wall_in: float) -> float:
     od_in = id_in + 2.0 * wall_in
     return PI_CONST * (od_in**2 - id_in**2) / 4.0
 
+
 # =============================
 # Module: Runtime Calculator
 # =============================
@@ -102,6 +103,7 @@ if page == "Runtime Calculator":
         else:
             st.info("Enter minutes greater than zero")
 
+
 # =============================
 # Module: Copper Wire Converter
 # =============================
@@ -129,6 +131,7 @@ elif page == "Copper Wire Converter":
         feet = length_in / 12.0
         st.subheader("Results")
         st.write(f"Estimated length: **{feet:,.0f} ft**")
+
 
 # =============================
 # Module: Coated Copper Converter
@@ -164,6 +167,7 @@ elif page == "Coated Copper Converter":
         st.write(f"Linear density: **{lin_den_lb_per_ft:,.5f} lb/ft**")
         st.write(f"Net wire weight: **{net_lb:,.3f} lb**")
         st.write(f"Estimated length: **{feet:,.0f} ft**")
+
 
 # =============================
 # Module: Wire Stretch Predictor
@@ -203,6 +207,7 @@ elif page == "Wire Stretch Predictor":
 
     if sigma_psi > YIELD_WARN_LOW:
         st.warning(f"Stress exceeds {YIELD_WARN_LOW:,} psi. Yield onset between {YIELD_WARN_LOW:,}–{YIELD_WARN_HIGH:,} psi.")
+
 
 # =============================
 # Module: PAA Usage
@@ -261,8 +266,9 @@ elif page == "PAA Usage":
     st.write(f"Subtotal: **{subtotal_lb:,.4f} lb**")
     st.write(f"Total with allowance: **{total_with_allowance_lb:,.4f} lb**")
 
+
 # =============================
-# Module: Anneal Temp Estimator (always uses repo CSV)
+# Module: Anneal Temp Estimator (history-driven, kNN + guardrails)
 # =============================
 elif page == "Anneal Temp Estimator":
     st.title("Anneal Temperature Estimator")
@@ -278,7 +284,7 @@ elif page == "Anneal Temp Estimator":
             st.error(f"Could not read {csv_path}: {e}")
 
         if df is not None:
-            # Normalize columns (supports either your original names or simplified)
+            # Normalize columns
             rename_map = {
                 "Wire Dia": "wire_dia",
                 "Speed": "speed_fpm",
@@ -297,29 +303,83 @@ elif page == "Anneal Temp Estimator":
                 df = df.dropna(subset=need)
                 df = df[(df["wire_dia"] > 0) & (df["speed_fpm"] > 0) & (df["annealer_ht_ft"] > 0)]
                 df["dwell_s"] = (df["annealer_ht_ft"] / df["speed_fpm"]) * 60.0
+                df["ln_d"] = np.log(df["wire_dia"])
+                df["ln_dw"] = np.log(df["dwell_s"])
 
-                # Regression: T = a + b*ln(dwell_s) + c*ln(diameter)
-                X = np.column_stack([np.ones(len(df)), np.log(df["dwell_s"].values), np.log(df["wire_dia"].values)])
-                y = df["anneal_temp_f"].values
-                coef, *_ = np.linalg.lstsq(X, y, rcond=None)
-                pred = X @ coef
-                mae = float(np.mean(np.abs(pred - y)))
-                rmse = float(np.sqrt(np.mean((pred - y) ** 2)))
+                # Diameter bins for guardrails
+                df["dia_bin"] = pd.qcut(df["wire_dia"], q=min(6, max(3, df["wire_dia"].nunique())), duplicates="drop")
+                bands = df.groupby("dia_bin")["anneal_temp_f"].quantile([0.25, 0.5, 0.75]).unstack()
 
+                def predict_knn(d_in, speed_fpm, height_ft, k=7, radius=1.0):
+                    dwell = (height_ft / speed_fpm) * 60.0
+                    ln_d = math.log(d_in)
+                    ln_dw = math.log(dwell)
+
+                    X = df[["ln_d", "ln_dw"]].values
+                    q = np.array([ln_d, ln_dw])
+                    dists = np.linalg.norm(X - q, axis=1)
+
+                    mask = dists <= radius
+                    if not np.any(mask):
+                        idx = np.argsort(dists)[:k]
+                        used = df.iloc[idx]
+                        warn = True
+                    else:
+                        used = df.loc[mask]
+                        if len(used) > k:
+                            idx = np.argsort(dists[mask])[:k]
+                            used = used.iloc[idx]
+                        warn = False
+
+                    dsel = np.maximum(1e-6, np.linalg.norm(used[["ln_d", "ln_dw"]].values - q, axis=1))
+                    w = 1.0 / dsel
+                    w = w / w.sum()
+                    temp = float(np.sum(w * used["anneal_temp_f"].values))
+
+                    # Clip to IQR band for nearest diameter bin
+                    try:
+                        mids = used.groupby("dia_bin")["wire_dia"].median()
+                        if len(mids) > 0:
+                            closest_bin = (mids - d_in).abs().idxmin()
+                            lo, med, hi = bands.loc[closest_bin, 0.25], bands.loc[closest_bin, 0.5], bands.loc[closest_bin, 0.75]
+                            temp = float(np.clip(temp, lo, hi))
+                    except Exception:
+                        pass
+
+                    return temp, warn, dwell
+
+                # UI
                 c1, c2, c3 = st.columns(3)
                 with c1:
                     diameter_in = st.number_input("Wire diameter (in)", min_value=0.001, value=0.0500, step=0.0010)
                 with c2:
-                    speed_fpm = st.number_input("Line speed (FPM)", min_value=0.1, value=18.0, step=0.5)
+                    speed = st.number_input("Line speed (FPM)", min_value=0.1, value=18.0, step=0.5)
                 with c3:
-                    height_ft = st.number_input("Annealer height (ft)", min_value=1.0, value=14.0, step=1.0)
+                    height = st.number_input("Annealer height (ft)", min_value=1.0, value=14.0, step=1.0)
 
-                dwell_s = (height_ft / speed_fpm) * 60.0
-                if diameter_in > 0 and dwell_s > 0:
-                    Xq = np.array([1.0, math.log(dwell_s), math.log(diameter_in)])
-                    T_pred = float(Xq @ coef)
+                if diameter_in > 0 and speed > 0 and height > 0:
+                    T_pred, out_of_range, dwell_s = predict_knn(diameter_in, speed, height)
                     st.subheader("Estimated anneal temperature")
                     st.write(f"**{T_pred:,.1f} °F**")
-                    st.caption(f"Model fit on repo data → MAE: {mae:.1f} °F, RMSE: {rmse:.1f} °F  |  dwell: {dwell_s:.1f} s")
+                    st.caption(f"dwell: {dwell_s:.1f} s  |  method: kNN on history with IQR clipping")
+
+                    # Show closest historical runs for context
+                    ln_d = math.log(diameter_in)
+                    ln_dw = math.log((height / speed) * 60.0)
+                    df["_dist"] = np.linalg.norm(df[["ln_d", "ln_dw"]].values - np.array([ln_d, ln_dw]), axis=1)
+                    st.write("Closest historical runs:")
+                    st.dataframe(
+                        df.sort_values("_dist").head(5)[["wire_dia", "speed_fpm", "annealer_ht_ft", "dwell_s", "anneal_temp_f"]]
+                        .rename(columns={
+                            "wire_dia": "dia (in)",
+                            "speed_fpm": "speed (FPM)",
+                            "annealer_ht_ft": "height (ft)",
+                            "dwell_s": "dwell (s)",
+                            "anneal_temp_f": "temp (°F)"
+                        })
+                    )
+
+                    if out_of_range:
+                        st.warning("Inputs are outside the dense part of the history. Use a short test pass to confirm.")
                 else:
-                    st.warning("Enter positive diameter and dwell.")
+                    st.warning("Enter positive diameter, speed, and height.")
