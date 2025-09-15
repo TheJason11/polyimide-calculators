@@ -1,4 +1,7 @@
+import os
 import math
+import numpy as np
+import pandas as pd
 import streamlit as st
 
 st.set_page_config(page_title="Polyimide Calculators", page_icon="🧮", layout="centered")
@@ -16,7 +19,6 @@ PI_DENSITY_G_PER_CM3_DEFAULT = 1.42
 IN3_TO_CM3 = 16.387064
 G_PER_LB = 453.59237
 PI_CONST = math.pi
-R_GAS = 8.314  # J/mol-K
 
 # -----------------------------
 # Sidebar navigation
@@ -27,7 +29,7 @@ page = st.sidebar.radio(
     [
         "Runtime Calculator",
         "Copper Wire Converter",
-        "Coated Copper Converter",  # NEW
+        "Coated Copper Converter",
         "Wire Stretch Predictor",
         "PAA Usage",
         "Anneal Temp Estimator",
@@ -48,21 +50,15 @@ def annulus_area_in2(id_in: float, wall_in: float) -> float:
     od_in = id_in + 2.0 * wall_in
     return PI_CONST * (od_in**2 - id_in**2) / 4.0
 
-def k_to_f(t_k: float) -> float:
-    return (t_k - 273.15) * 9.0/5.0 + 32.0
-
-# -----------------------------
+# =============================
 # Module: Runtime Calculator
-# -----------------------------
+# =============================
 if page == "Runtime Calculator":
     st.title("Job Runtime Calculator")
     st.caption("Compute runtime, footage, or rate from feet, time, and speed")
 
-    mode = st.radio(
-        "Choose calculator",
-        ["Feet and Speed → Runtime", "Time and Speed → Feet", "Feet and Time → Rate"],
-        index=0,
-    )
+    mode = st.radio("Choose calculator",
+                    ["Feet and Speed → Runtime", "Time and Speed → Feet", "Feet and Time → Rate"], index=0)
 
     if mode == "Feet and Speed → Runtime":
         c1, c2 = st.columns(2)
@@ -70,10 +66,8 @@ if page == "Runtime Calculator":
             feet = st.number_input("Total feet", min_value=0.0, value=12000.0, step=100.0)
         with c2:
             fpm = st.number_input("Line speed (FPM)", min_value=0.0, value=18.0, step=0.5)
-
         run_minutes = feet / fpm if fpm > 0 else 0.0
         run_hours = run_minutes / 60.0
-
         st.subheader("Results")
         st.write(f"Runtime: **{run_minutes:,.2f} minutes**  |  **{run_hours:,.2f} hours**")
         st.write(f"Throughput: **{fpm*60:,.0f} ft per hour**")
@@ -86,11 +80,9 @@ if page == "Runtime Calculator":
             minutes = st.number_input("Minutes", min_value=0.0, value=0.0, step=5.0)
         with c3:
             fpm = st.number_input("Line speed (FPM)", min_value=0.0, value=18.0, step=0.5)
-
         total_minutes = hours * 60.0 + minutes
         feet = fpm * total_minutes
         ft_per_hour = fpm * 60.0
-
         st.subheader("Results")
         st.write(f"Total minutes: **{total_minutes:,.2f}**")
         st.write(f"Feet possible: **{feet:,.0f} ft**")
@@ -102,7 +94,6 @@ if page == "Runtime Calculator":
             feet_run = st.number_input("Feet run", min_value=0.0, value=600.0, step=50.0)
         with c2:
             minutes_run = st.number_input("Minutes", min_value=0.0, value=60.0, step=1.0)
-
         if minutes_run > 0:
             fpm_calc = feet_run / minutes_run
             st.subheader("Results")
@@ -111,12 +102,11 @@ if page == "Runtime Calculator":
         else:
             st.info("Enter minutes greater than zero")
 
-# -----------------------------
+# =============================
 # Module: Copper Wire Converter
-# -----------------------------
+# =============================
 elif page == "Copper Wire Converter":
     st.title("Copper Wire Length ↔ Weight")
-
     mode = st.radio("Choose converter", ["Feet → Pounds", "Pounds → Feet"], index=0)
 
     c1, c2 = st.columns(2)
@@ -133,20 +123,18 @@ elif page == "Copper Wire Converter":
         pounds = volume_in3 * COPPER_DENSITY_LB_PER_IN3
         st.subheader("Results")
         st.write(f"Estimated weight: **{pounds:,.2f} lb**")
-
-    elif mode == "Pounds → Feet":
+    else:
         pounds = st.number_input("Weight (lb)", min_value=0.0, value=54.0, step=0.5)
         length_in = pounds / (COPPER_DENSITY_LB_PER_IN3 * area_in2) if area_in2 > 0 else 0.0
         feet = length_in / 12.0
         st.subheader("Results")
         st.write(f"Estimated length: **{feet:,.0f} ft**")
 
-# -----------------------------
-# Module: Coated Copper Converter (NEW)
-# -----------------------------
+# =============================
+# Module: Coated Copper Converter
+# =============================
 elif page == "Coated Copper Converter":
     st.title("Coated Copper Length ↔ Weight")
-
     mode = st.radio("Choose converter", ["Feet → Pounds", "Pounds → Feet"], index=0)
 
     c1, c2, c3 = st.columns(3)
@@ -157,11 +145,8 @@ elif page == "Coated Copper Converter":
     with c3:
         coat_density = st.number_input("Coating density (lb/in³)", min_value=0.0100, max_value=0.0800, value=0.0513, step=0.0001)
 
-    # Cross-sections
     area_cu_in2 = circle_area_in2(id_in)
     area_coat_in2 = annulus_area_in2(id_in, wall_in)
-
-    # Linear density (lb/ft)
     lin_den_lb_per_ft = 12.0 * (area_cu_in2 * COPPER_DENSITY_LB_PER_IN3 + area_coat_in2 * coat_density)
 
     if mode == "Feet → Pounds":
@@ -170,8 +155,7 @@ elif page == "Coated Copper Converter":
         st.subheader("Results")
         st.write(f"Linear density: **{lin_den_lb_per_ft:,.5f} lb/ft**")
         st.write(f"Estimated weight: **{pounds:,.3f} lb**")
-
-    elif mode == "Pounds → Feet":
+    else:
         gross_lb = st.number_input("Gross spool weight (lb)", min_value=0.0, value=12.0, step=0.1)
         tare_lb = st.number_input("Spool tare (lb)", min_value=0.0, value=0.0, step=0.1)
         net_lb = max(gross_lb - tare_lb, 0.0)
@@ -181,9 +165,9 @@ elif page == "Coated Copper Converter":
         st.write(f"Net wire weight: **{net_lb:,.3f} lb**")
         st.write(f"Estimated length: **{feet:,.0f} ft**")
 
-# -----------------------------
+# =============================
 # Module: Wire Stretch Predictor
-# -----------------------------
+# =============================
 elif page == "Wire Stretch Predictor":
     st.title("Wire Stretch Predictor")
     st.caption("Elastic estimate based on copper properties and applied tension")
@@ -220,9 +204,9 @@ elif page == "Wire Stretch Predictor":
     if sigma_psi > YIELD_WARN_LOW:
         st.warning(f"Stress exceeds {YIELD_WARN_LOW:,} psi. Yield onset between {YIELD_WARN_LOW:,}–{YIELD_WARN_HIGH:,} psi.")
 
-# -----------------------------
+# =============================
 # Module: PAA Usage
-# -----------------------------
+# =============================
 elif page == "PAA Usage":
     st.title("PAA Usage Calculator")
 
@@ -277,40 +261,65 @@ elif page == "PAA Usage":
     st.write(f"Subtotal: **{subtotal_lb:,.4f} lb**")
     st.write(f"Total with allowance: **{total_with_allowance_lb:,.4f} lb**")
 
-# -----------------------------
-# Module: Anneal Temp Estimator
-# -----------------------------
+# =============================
+# Module: Anneal Temp Estimator (always uses repo CSV)
+# =============================
 elif page == "Anneal Temp Estimator":
     st.title("Anneal Temperature Estimator")
 
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        wire_d_in = st.number_input("Wire diameter (in)", min_value=0.0005, value=0.0500, step=0.0010)
-    with c2:
-        height_ft = st.number_input("Annealer height (ft)", min_value=1.0, value=12.0, step=1.0)
-    with c3:
-        fpm = st.number_input("Line speed (FPM)", min_value=0.1, value=18.0, step=0.5)
-
-    c4, c5, c6 = st.columns(3)
-    with c4:
-        target_oxide_um = st.number_input("Target oxide thickness (µm)", min_value=0.01, value=0.20, step=0.01)
-    with c5:
-        k0_ox = st.number_input("Oxide k0 (m²/s)", min_value=1e-20, value=1e-10, step=1e-10, format="%.1e")
-    with c6:
-        Ea_ox_kJ = st.number_input("Oxide Ea (kJ/mol)", min_value=20.0, value=120.0, step=5.0)
-
-    dwell_s = (height_ft / fpm) * 60.0
-    x_m = target_oxide_um * 1e-6
-    Ea_ox_J = Ea_ox_kJ * 1000.0
-
-    ox_possible = (k0_ox * dwell_s) > (x_m**2)
-    T_ox_K = None
-    if ox_possible:
-        T_ox_K = Ea_ox_J / (R_GAS * math.log((k0_ox * dwell_s) / (x_m**2)))
-
-    st.subheader("Results")
-    st.write(f"Dwell time: **{dwell_s:,.1f} s**")
-    if T_ox_K:
-        st.write(f"Required oven set: **{k_to_f(T_ox_K):,.1f} °F**")
+    csv_path = "annealing_dataset_clean.csv"
+    if not os.path.exists(csv_path):
+        st.error(f"Dataset not found: {csv_path}. Add it to the repo.")
     else:
-        st.error("Target not reachable with current inputs")
+        try:
+            df = pd.read_csv(csv_path)
+        except Exception as e:
+            df = None
+            st.error(f"Could not read {csv_path}: {e}")
+
+        if df is not None:
+            # Normalize columns (supports either your original names or simplified)
+            rename_map = {
+                "Wire Dia": "wire_dia",
+                "Speed": "speed_fpm",
+                "Annealer Ht": "annealer_ht_ft",
+                "Anneal T": "anneal_temp_f",
+                "wire_dia": "wire_dia",
+                "speed_fpm": "speed_fpm",
+                "annealer_ht_ft": "annealer_ht_ft",
+                "anneal_temp_f": "anneal_temp_f",
+            }
+            df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+            need = ["wire_dia", "speed_fpm", "annealer_ht_ft", "anneal_temp_f"]
+            if not set(need).issubset(df.columns):
+                st.error(f"CSV must contain columns: {need}")
+            else:
+                df = df.dropna(subset=need)
+                df = df[(df["wire_dia"] > 0) & (df["speed_fpm"] > 0) & (df["annealer_ht_ft"] > 0)]
+                df["dwell_s"] = (df["annealer_ht_ft"] / df["speed_fpm"]) * 60.0
+
+                # Regression: T = a + b*ln(dwell_s) + c*ln(diameter)
+                X = np.column_stack([np.ones(len(df)), np.log(df["dwell_s"].values), np.log(df["wire_dia"].values)])
+                y = df["anneal_temp_f"].values
+                coef, *_ = np.linalg.lstsq(X, y, rcond=None)
+                pred = X @ coef
+                mae = float(np.mean(np.abs(pred - y)))
+                rmse = float(np.sqrt(np.mean((pred - y) ** 2)))
+
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    diameter_in = st.number_input("Wire diameter (in)", min_value=0.001, value=0.0500, step=0.0010)
+                with c2:
+                    speed_fpm = st.number_input("Line speed (FPM)", min_value=0.1, value=18.0, step=0.5)
+                with c3:
+                    height_ft = st.number_input("Annealer height (ft)", min_value=1.0, value=14.0, step=1.0)
+
+                dwell_s = (height_ft / speed_fpm) * 60.0
+                if diameter_in > 0 and dwell_s > 0:
+                    Xq = np.array([1.0, math.log(dwell_s), math.log(diameter_in)])
+                    T_pred = float(Xq @ coef)
+                    st.subheader("Estimated anneal temperature")
+                    st.write(f"**{T_pred:,.1f} °F**")
+                    st.caption(f"Model fit on repo data → MAE: {mae:.1f} °F, RMSE: {rmse:.1f} °F  |  dwell: {dwell_s:.1f} s")
+                else:
+                    st.warning("Enter positive diameter and dwell.")
