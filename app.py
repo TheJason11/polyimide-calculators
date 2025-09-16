@@ -39,7 +39,7 @@ page = st.sidebar.radio(
 )
 
 # -----------------------------
-# Helpers (4-decimal inputs)
+# Helpers
 # -----------------------------
 def inches_from_feet(feet: float) -> float:
     return feet * 12.0
@@ -51,25 +51,13 @@ def annulus_area_in2(id_in: float, wall_in: float) -> float:
     od_in = id_in + 2.0 * wall_in
     return PI_CONST * (od_in**2 - id_in**2) / 4.0
 
-def num_input4(label, value, step, minv, maxv=None):
-    return st.number_input(
-        label,
-        value=float(value),
-        step=float(step),
-        min_value=float(minv),
-        max_value=None if maxv is None else float(maxv),
-        format="%.4f",
-    )
-
-def num_input1(label, value, step, minv, maxv=None):
-    return st.number_input(
-        label,
-        value=float(value),
-        step=float(step),
-        min_value=float(minv),
-        max_value=None if maxv is None else float(maxv),
-        format="%.1f",
-    )
+def float_input(label, default):
+    val_str = st.text_input(label, str(default))
+    try:
+        return float(val_str)
+    except ValueError:
+        st.error(f"Invalid number for {label}")
+        return default
 
 # =============================
 # Module: Runtime Calculator
@@ -84,9 +72,9 @@ if page == "Runtime Calculator":
     if mode == "Feet and Speed → Runtime":
         c1, c2 = st.columns(2)
         with c1:
-            feet = num_input4("Total feet", 12000.0, 100.0, 0.0)
+            feet = float_input("Total feet", 12000.0)
         with c2:
-            fpm = num_input4("Line speed (FPM)", 18.0, 0.5, 0.0)
+            fpm = float_input("Line speed (FPM)", 18.0)
         run_minutes = feet / fpm if fpm > 0 else 0.0
         run_hours = run_minutes / 60.0
         st.subheader("Results")
@@ -96,11 +84,11 @@ if page == "Runtime Calculator":
     elif mode == "Time and Speed → Feet":
         c1, c2, c3 = st.columns(3)
         with c1:
-            hours = num_input4("Hours", 3.0, 0.5, 0.0)
+            hours = float_input("Hours", 3.0)
         with c2:
-            minutes = num_input4("Minutes", 0.0, 5.0, 0.0)
+            minutes = float_input("Minutes", 0.0)
         with c3:
-            fpm = num_input4("Line speed (FPM)", 18.0, 0.5, 0.0)
+            fpm = float_input("Line speed (FPM)", 18.0)
         total_minutes = hours * 60.0 + minutes
         feet = fpm * total_minutes
         ft_per_hour = fpm * 60.0
@@ -112,9 +100,9 @@ if page == "Runtime Calculator":
     elif mode == "Feet and Time → Rate":
         c1, c2 = st.columns(2)
         with c1:
-            feet_run = num_input4("Feet run", 600.0, 50.0, 0.0)
+            feet_run = float_input("Feet run", 600.0)
         with c2:
-            minutes_run = num_input4("Minutes", 60.0, 1.0, 0.0)
+            minutes_run = float_input("Minutes", 60.0)
         if minutes_run > 0:
             fpm_calc = feet_run / minutes_run
             st.subheader("Results")
@@ -132,20 +120,20 @@ elif page == "Copper Wire Converter":
 
     c1, c2 = st.columns(2)
     with c1:
-        d_in = num_input4("Wire diameter (in)", 0.0500, 0.0010, 0.0001)
+        d_in = float_input("Wire diameter (in)", 0.0500)
     with c2:
         area_in2 = circle_area_in2(d_in)
         st.write(f"Cross section area: **{area_in2:.6f} in²**")
 
     if mode == "Feet → Pounds":
-        feet = num_input4("Length (ft)", 12000.0, 100.0, 0.0)
+        feet = float_input("Length (ft)", 12000.0)
         length_in = inches_from_feet(feet)
         volume_in3 = area_in2 * length_in
         pounds = volume_in3 * COPPER_DENSITY_LB_PER_IN3
         st.subheader("Results")
         st.write(f"Estimated weight: **{pounds:,.2f} lb**")
     else:
-        pounds = num_input4("Weight (lb)", 54.0, 0.5, 0.0)
+        pounds = float_input("Weight (lb)", 54.0)
         length_in = pounds / (COPPER_DENSITY_LB_PER_IN3 * area_in2) if area_in2 > 0 else 0.0
         feet = length_in / 12.0
         st.subheader("Results")
@@ -160,25 +148,25 @@ elif page == "Coated Copper Converter":
 
     c1, c2, c3 = st.columns(3)
     with c1:
-        id_in = num_input4("Bare copper diameter, ID (in)", 0.0500, 0.0010, 0.0001)
+        id_in = float_input("Bare copper diameter, ID (in)", 0.0500)
     with c2:
-        wall_in = num_input4("Coating wall (in)", 0.0015, 0.0001, 0.0)
+        wall_in = float_input("Coating wall (in)", 0.0015)
     with c3:
-        coat_density = num_input4("Coating density (lb/in³)", 0.0513, 0.0001, 0.0100, 0.0800)
+        coat_density = float_input("Coating density (lb/in³)", 0.0513)
 
     area_cu_in2 = circle_area_in2(id_in)
     area_coat_in2 = annulus_area_in2(id_in, wall_in)
     lin_den_lb_per_ft = 12.0 * (area_cu_in2 * COPPER_DENSITY_LB_PER_IN3 + area_coat_in2 * coat_density)
 
     if mode == "Feet → Pounds":
-        feet = num_input4("Length (ft)", 1500.0, 50.0, 0.0)
+        feet = float_input("Length (ft)", 1500.0)
         pounds = feet * lin_den_lb_per_ft
         st.subheader("Results")
         st.write(f"Linear density: **{lin_den_lb_per_ft:,.5f} lb/ft**")
         st.write(f"Estimated weight: **{pounds:,.3f} lb**")
     else:
-        gross_lb = num_input4("Gross spool weight (lb)", 12.0, 0.1, 0.0)
-        tare_lb = num_input4("Spool tare (lb)", 0.0, 0.1, 0.0)
+        gross_lb = float_input("Gross spool weight (lb)", 12.0)
+        tare_lb = float_input("Spool tare (lb)", 0.0)
         net_lb = max(gross_lb - tare_lb, 0.0)
         feet = (net_lb / lin_den_lb_per_ft) if lin_den_lb_per_ft > 0 else 0.0
         st.subheader("Results")
@@ -195,19 +183,19 @@ elif page == "Wire Stretch Predictor":
 
     c1, c2, c3 = st.columns(3)
     with c1:
-        d0_in = num_input4("Starting diameter (in)", 0.0500, 0.0010, 0.0001)
+        d0_in = float_input("Starting diameter (in)", 0.0500)
     with c2:
-        tension_lbf = num_input4("Applied tension (lbf)", 15.0, 1.0, 0.0)
+        tension_lbf = float_input("Applied tension (lbf)", 15.0)
     with c3:
         passes = st.number_input("Number of passes", min_value=1, value=10, step=1, format="%d")
 
     c4, c5, c6 = st.columns(3)
     with c4:
-        anneal_temp_f = num_input1("Anneal temp (°F)", 700.0, 10.0, 0.0)
+        anneal_temp_f = float_input("Anneal temp (°F)", 700.0)
     with c5:
-        oven_height_ft = num_input4("Oven height (ft)", 12.0, 1.0, 1.0)
+        oven_height_ft = float_input("Oven height (ft)", 12.0)
     with c6:
-        line_speed_fpm = num_input4("Line speed (FPM)", 18.0, 0.5, 0.1)
+        line_speed_fpm = float_input("Line speed (FPM)", 18.0)
 
     cal = st.slider("Calibration factor", min_value=0.50, max_value=1.50, value=1.00, step=0.01)
 
@@ -233,29 +221,29 @@ elif page == "PAA Usage":
 
     c1, c2, c3 = st.columns(3)
     with c1:
-        id_in = num_input4("ID (in)", 0.0160, 0.0005, 0.0001)
+        id_in = float_input("ID (in)", 0.0160)
     with c2:
-        wall_in = num_input4("Wall (in)", 0.0010, 0.0001, 0.0001)
+        wall_in = float_input("Wall (in)", 0.0010)
     with c3:
-        length_ft = num_input4("Finished length (ft)", 1500.0, 50.0, 0.0)
+        length_ft = float_input("Finished length (ft)", 1500.0)
 
     c4, c5, c6 = st.columns(3)
     with c4:
-        solids_frac = num_input4("Solids fraction", 0.15, 0.01, 0.01, 1.0)
+        solids_frac = float_input("Solids fraction", 0.15)
     with c5:
-        startup_ft = num_input4("Startup scrap (ft)", 150.0, 10.0, 0.0)
+        startup_ft = float_input("Startup scrap (ft)", 150.0)
     with c6:
-        shutdown_ft = num_input4("Shutdown scrap (ft)", 50.0, 10.0, 0.0)
+        shutdown_ft = float_input("Shutdown scrap (ft)", 50.0)
 
     c7, c8, c9 = st.columns(3)
     with c7:
-        hold_up_cm3 = num_input4("Hold up volume (cm³)", 400.0, 10.0, 0.0)
+        hold_up_cm3 = float_input("Hold up volume (cm³)", 400.0)
     with c8:
-        heel_cm3 = num_input4("Heel volume (cm³)", 120.0, 5.0, 0.0)
+        heel_cm3 = float_input("Heel volume (cm³)", 120.0)
     with c9:
-        soln_density_g_cm3 = num_input4("Solution density (g/cm³)", 1.06, 0.01, 0.80, 1.50)
+        soln_density_g_cm3 = float_input("Solution density (g/cm³)", 1.06)
 
-    allowance_frac = num_input4("Allowance fraction", 0.05, 0.01, 0.0, 0.50)
+    allowance_frac = float_input("Allowance fraction", 0.05)
 
     length_in = inches_from_feet(length_ft)
     A_wall_in2 = annulus_area_in2(id_in, wall_in)
@@ -291,19 +279,19 @@ elif page == "Anneal Temp Estimator":
     # Inputs
     c1, c2, c3 = st.columns(3)
     with c1:
-        diameter_in = num_input4("Wire diameter (in)", 0.0500, 0.0010, 0.0010)
+        diameter_in = float_input("Wire diameter (in)", 0.0500)
     with c2:
-        speed_fpm = num_input4("Line speed (FPM)", 18.0000, 0.5000, 0.1000)
+        speed_fpm = float_input("Line speed (FPM)", 18.0000)
     with c3:
-        height_ft = num_input4("Annealer height (ft)", 8.0000, 1.0000, 1.0000)
+        height_ft = float_input("Annealer height (ft)", 8.0000)
 
     with st.expander("Advanced physics baseline"):
-        x_um = num_input4("Target oxide thickness (µm)", 0.2000, 0.0500, 0.0200, 5.0000)
+        x_um = float_input("Target oxide thickness (µm)", 0.2000)
         k0 = st.number_input("Parabolic rate K0 (m²/s)", value=1e-10, step=1e-11, format="%.1e")
-        ea_kj = num_input4("Activation energy Ea (kJ/mol)", 120.0000, 5.0000, 40.0000, 200.0000)
-        alpha = num_input4("Thermal diffusivity α (m²/s)", 1.11e-4, 1e-5, 1e-5, 5e-4)  # copper ~1.11e-4
-        beta = num_input4("Heat up multiplier β", 1.0000, 0.1000, 0.1000, 5.0000)
-        T_ambient_F = num_input1("Ambient (°F)", 75.0, 1.0, -40.0, 200.0)
+        ea_kj = float_input("Activation energy Ea (kJ/mol)", 120.0000)
+        alpha = float_input("Thermal diffusivity α (m²/s)", 1.11e-4)
+        beta = float_input("Heat up multiplier β", 1.0000)
+        T_ambient_F = float_input("Ambient (°F)", 75.0)
 
     def physics_temp_required(d_in, speed, height, x_um, k0, ea_kj, alpha, beta, T_amb_F):
         dwell_s = (height / speed) * 60.0
@@ -325,7 +313,6 @@ elif page == "Anneal Temp Estimator":
         diameter_in, speed_fpm, height_ft, x_um, k0, ea_kj, alpha, beta, T_ambient_F
     )
 
-    # Load dataset
     csv_path = "annealing_dataset_clean.csv"
     if not os.path.exists(csv_path):
         st.error(f"Dataset not found: {csv_path}. Add it to the repo.")
@@ -337,7 +324,6 @@ elif page == "Anneal Temp Estimator":
             st.error(f"Could not read {csv_path}: {e}")
 
         if df is not None:
-            # Normalize column names
             rename_map = {
                 "Wire Dia": "wire_dia", "Speed": "speed_fpm",
                 "Annealer Ht": "annealer_ht_ft", "Anneal T": "anneal_temp_f",
@@ -354,19 +340,18 @@ elif page == "Anneal Temp Estimator":
                 if len(df) < 8:
                     st.error("Not enough rows to fit a stable model. Add more historical runs.")
                 else:
-                    # Features
                     df["dwell_s"] = (df["annealer_ht_ft"] / df["speed_fpm"]) * 60.0
                     df["ln_d"] = np.log(df["wire_dia"])
                     df["ln_dw"] = np.log(df["dwell_s"])
                     y = df["anneal_temp_f"].values
 
-                    # Global ridge backbone on [1, ln_d, ln_dw]
+                    # Global ridge
                     Xg = np.column_stack([np.ones(len(df)), df["ln_d"].values, df["ln_dw"].values])
                     lam = 10.0
                     G = Xg.T @ Xg + lam * np.eye(Xg.shape[1])
                     cg = np.linalg.solve(G, Xg.T @ y)
 
-                    # Local neighborhood in standardized space
+                    # Local neighborhood
                     ln_d_all = df["ln_d"].values
                     ln_dw_all = df["ln_dw"].values
                     mu = np.array([ln_d_all.mean(), ln_dw_all.mean()])
@@ -384,33 +369,27 @@ elif page == "Anneal Temp Estimator":
                     idx = np.argsort(dist)[:k]
                     neigh = df.iloc[idx].copy()
 
-                    # Local linear fit
                     Xl = np.column_stack([np.ones(len(neigh)), neigh["ln_d"].values, neigh["ln_dw"].values])
                     yl = neigh["anneal_temp_f"].values
                     cl, *_ = np.linalg.lstsq(Xl, yl, rcond=None)
                     a, b, c = float(cl[0]), float(cl[1]), float(cl[2])
 
-                    # Sign guards, softened magnitude
-                    b = max(b, 1.0)    # temp rises with diameter in this dataset
-                    c = min(c, -1.0)   # temp falls with longer dwell
+                    b = max(b, 1.0)
+                    c = min(c, -1.0)
 
                     ln_d = q_raw[0]; ln_dw = q_raw[1]
                     T_local = a + b * ln_d + c * ln_dw
                     T_global = float(cg[0] + cg[1]*ln_d + cg[2]*ln_dw)
 
-                    # Range test using 75th percentile distance
                     pr75 = float(np.percentile(dist[idx], 75))
                     out_of_range = pr75 > 1.25
 
-                    # Blend local and global first
                     w_local = 0.75 if not out_of_range else 0.50
                     T_mix = w_local * T_local + (1.0 - w_local) * T_global
 
-                    # Gentle physics blend only if out of range
                     physics_w = 0.00 if not out_of_range else 0.20
                     T_blend = (1.0 - physics_w) * T_mix + physics_w * T_phys_F
 
-                    # Final clip
                     T_final = float(np.clip(T_blend, 650.0, 1200.0))
 
                     st.subheader("Estimated anneal temperature")
@@ -435,7 +414,6 @@ elif page == "Anneal Temp Estimator":
                         )
 
                     with st.expander("Data QA"):
-                        # quick checks to help catch odd rows
                         bad_numeric = df[need].isna().sum().sum()
                         st.write(f"Rows: {len(df)}")
                         st.write(f"Empty cells across required columns: {bad_numeric}")
