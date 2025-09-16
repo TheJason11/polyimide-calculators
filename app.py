@@ -124,7 +124,7 @@ if page == "Runtime Calculator":
             st.info("Enter minutes greater than zero")
 
 # =============================
-# Module: Cu Wire Converter
+# Module: Copper Wire Converter
 # =============================
 elif page == "Copper Wire Converter":
     st.title("Copper Wire Length ↔ Weight")
@@ -249,7 +249,7 @@ elif page == "PAA Usage":
 
     c7, c8, c9 = st.columns(3)
     with c7:
-        hold_up_cm3 = num_input4("Hold-up volume (cm³)", 400.0, 10.0, 0.0)
+        hold_up_cm3 = num_input4("Hold up volume (cm³)", 400.0, 10.0, 0.0)
     with c8:
         heel_cm3 = num_input4("Heel volume (cm³)", 120.0, 5.0, 0.0)
     with c9:
@@ -277,40 +277,38 @@ elif page == "PAA Usage":
     st.subheader("Results")
     st.write(f"Solution for finished length: **{solution_for_polymer_lb:,.4f} lb**")
     st.write(f"Startup + shutdown scrap: **{scrap_solution_lb:,.4f} lb**")
-    st.write(f"Hold-up mass: **{hold_up_mass_lb:,.3f} lb**")
+    st.write(f"Hold up mass: **{hold_up_mass_lb:,.3f} lb**")
     st.write(f"Heel mass: **{heel_mass_lb:,.3f} lb**")
     st.write(f"Subtotal: **{subtotal_lb:,.4f} lb**")
     st.write(f"Total with allowance: **{total_with_allowance_lb:,.4f} lb**")
 
 # =============================
-# Module: Anneal Temp Estimator (local monotonic fit + physics blend)
+# Module: Anneal Temp Estimator
 # =============================
 elif page == "Anneal Temp Estimator":
-    st.title("Anneal Temperature Estimator (Local + Monotonic + Physics Blend)")
+    st.title("Anneal Temperature Estimator (Local + Global + Physics Blend)")
 
-    # Inputs (4 decimals for dimensions & speeds)
+    # Inputs
     c1, c2, c3 = st.columns(3)
     with c1:
         diameter_in = num_input4("Wire diameter (in)", 0.0500, 0.0010, 0.0010)
     with c2:
         speed_fpm = num_input4("Line speed (FPM)", 18.0000, 0.5000, 0.1000)
     with c3:
-        height_ft = num_input4("Annealer height (ft)", 14.0000, 1.0000, 1.0000)
+        height_ft = num_input4("Annealer height (ft)", 8.0000, 1.0000, 1.0000)
 
-    with st.expander("Advanced (physics baseline)"):
-        # Parabolic oxidation baseline with heat-up lag
+    with st.expander("Advanced physics baseline"):
         x_um = num_input4("Target oxide thickness (µm)", 0.2000, 0.0500, 0.0200, 5.0000)
         k0 = st.number_input("Parabolic rate K0 (m²/s)", value=1e-10, step=1e-11, format="%.1e")
         ea_kj = num_input4("Activation energy Ea (kJ/mol)", 120.0000, 5.0000, 40.0000, 200.0000)
         alpha = num_input4("Thermal diffusivity α (m²/s)", 1.11e-4, 1e-5, 1e-5, 5e-4)  # copper ~1.11e-4
-        beta = num_input4("Heat-up multiplier β (–)", 1.0000, 0.1000, 0.1000, 5.0000)
+        beta = num_input4("Heat up multiplier β", 1.0000, 0.1000, 0.1000, 5.0000)
         T_ambient_F = num_input1("Ambient (°F)", 75.0, 1.0, -40.0, 200.0)
-        physics_weight = st.slider("Physics blend (out-of-range)", 0.0, 1.0, 0.30, 0.05)
 
     def physics_temp_required(d_in, speed, height, x_um, k0, ea_kj, alpha, beta, T_amb_F):
         dwell_s = (height / speed) * 60.0
         d_m = d_in * 0.0254
-        t_heat = beta * (d_m**2) / (alpha * (math.pi**2))  # s
+        t_heat = beta * (d_m**2) / (alpha * (math.pi**2))
         t_eff = max(1e-3, dwell_s - t_heat)
         x_m = x_um * 1e-6
         Ea = ea_kj * 1000.0
@@ -323,7 +321,6 @@ elif page == "Anneal Temp Estimator":
         T_F = max(T_F, T_amb_F + 50.0)
         return T_F, dwell_s
 
-    # Physics baseline
     T_phys_F, dwell_s = physics_temp_required(
         diameter_in, speed_fpm, height_ft, x_um, k0, ea_kj, alpha, beta, T_ambient_F
     )
@@ -340,7 +337,7 @@ elif page == "Anneal Temp Estimator":
             st.error(f"Could not read {csv_path}: {e}")
 
         if df is not None:
-            # Normalize columns
+            # Normalize column names
             rename_map = {
                 "Wire Dia": "wire_dia", "Speed": "speed_fpm",
                 "Annealer Ht": "annealer_ht_ft", "Anneal T": "anneal_temp_f",
@@ -354,8 +351,8 @@ elif page == "Anneal Temp Estimator":
             else:
                 df = df.dropna(subset=need)
                 df = df[(df["wire_dia"] > 0) & (df["speed_fpm"] > 0) & (df["annealer_ht_ft"] > 0)]
-                if len(df) < 3:
-                    st.error("Not enough rows to fit a local model. Add more historical runs.")
+                if len(df) < 8:
+                    st.error("Not enough rows to fit a stable model. Add more historical runs.")
                 else:
                     # Features
                     df["dwell_s"] = (df["annealer_ht_ft"] / df["speed_fpm"]) * 60.0
@@ -363,69 +360,83 @@ elif page == "Anneal Temp Estimator":
                     df["ln_dw"] = np.log(df["dwell_s"])
                     y = df["anneal_temp_f"].values
 
-                    # Global slopes for minimal sensitivity
+                    # Global ridge backbone on [1, ln_d, ln_dw]
                     Xg = np.column_stack([np.ones(len(df)), df["ln_d"].values, df["ln_dw"].values])
-                    cg, *_ = np.linalg.lstsq(Xg, y, rcond=None)
-                    b_min = max(5.0, cg[1])   # °F per ln(d)
-                    c_min = min(-5.0, cg[2])  # °F per ln(dwell)
+                    lam = 10.0
+                    G = Xg.T @ Xg + lam * np.eye(Xg.shape[1])
+                    cg = np.linalg.solve(G, Xg.T @ y)
 
-                    # Local neighborhood in log-space
-                    q = np.array([math.log(diameter_in), math.log(dwell_s)])
-                    Z = df[["ln_d", "ln_dw"]].values
-                    dist = np.linalg.norm(Z - q, axis=1)
-                    k = min(12, len(df))
+                    # Local neighborhood in standardized space
+                    ln_d_all = df["ln_d"].values
+                    ln_dw_all = df["ln_dw"].values
+                    mu = np.array([ln_d_all.mean(), ln_dw_all.mean()])
+                    sd = np.array([ln_d_all.std(ddof=1), ln_dw_all.std(ddof=1)])
+                    sd[sd == 0] = 1.0
+
+                    q_raw = np.array([math.log(diameter_in), math.log(dwell_s)])
+                    qz = (q_raw - mu) / sd
+                    Zz = (df[["ln_d","ln_dw"]].values - mu) / sd
+
+                    from numpy.linalg import norm
+                    dist = norm(Zz - qz, axis=1)
+
+                    k = min(40, len(df))
                     idx = np.argsort(dist)[:k]
                     neigh = df.iloc[idx].copy()
-                    out_of_range = float(np.median(dist[idx])) > 0.5  # heuristic radius
 
-                    # Local linear fit: T ≈ a + b·ln(d) + c·ln(dwell)
+                    # Local linear fit
                     Xl = np.column_stack([np.ones(len(neigh)), neigh["ln_d"].values, neigh["ln_dw"].values])
                     yl = neigh["anneal_temp_f"].values
-                    cl, *_ = np.linalg.lstsq(Xl, yl, rcond=None)  # [a, b, c]
+                    cl, *_ = np.linalg.lstsq(Xl, yl, rcond=None)
                     a, b, c = float(cl[0]), float(cl[1]), float(cl[2])
 
-                    # Monotonic guardrails (enforce trends)
-                    if b < 0:
-                        b = max(b_min, 5.0)
-                    else:
-                        b = max(b, 5.0 if np.isfinite(b_min) else b)
-                    if c > 0:
-                        c = min(c_min, -5.0)
-                    else:
-                        c = min(c, -5.0 if np.isfinite(c_min) else c)
+                    # Sign guards, softened magnitude
+                    b = max(b, 1.0)    # temp rises with diameter in this dataset
+                    c = min(c, -1.0)   # temp falls with longer dwell
 
-                    # Predict local + blend with physics
-                    ln_d = q[0]; ln_dw = q[1]
+                    ln_d = q_raw[0]; ln_dw = q_raw[1]
                     T_local = a + b * ln_d + c * ln_dw
-                    blend = physics_weight if out_of_range else 0.15
-                    T_blend = (1.0 - blend) * T_local + blend * T_phys_F
+                    T_global = float(cg[0] + cg[1]*ln_d + cg[2]*ln_dw)
 
-                    # Final sanity clip
-                    T_final = float(np.clip(T_blend, 600.0, 1200.0))
+                    # Range test using 75th percentile distance
+                    pr75 = float(np.percentile(dist[idx], 75))
+                    out_of_range = pr75 > 1.25
+
+                    # Blend local and global first
+                    w_local = 0.75 if not out_of_range else 0.50
+                    T_mix = w_local * T_local + (1.0 - w_local) * T_global
+
+                    # Gentle physics blend only if out of range
+                    physics_w = 0.00 if not out_of_range else 0.20
+                    T_blend = (1.0 - physics_w) * T_mix + physics_w * T_phys_F
+
+                    # Final clip
+                    T_final = float(np.clip(T_blend, 650.0, 1200.0))
 
                     st.subheader("Estimated anneal temperature")
                     st.write(f"**{T_final:,.1f} °F**")
+
                     st.caption(
-                        f"dwell: {dwell_s:.1f} s  |  local slopes: "
-                        f"d → +{b:.1f} °F/ln(in), dwell → {c:.1f} °F/ln(s)  "
-                        f"| physics: {T_phys_F:,.1f} °F  | blend={blend:.2f}"
+                        f"dwell: {dwell_s:.1f} s  |  local slopes: d → +{b:.2f} °F/ln(in), "
+                        f"dwell → {c:.2f} °F/ln(s)  |  global: {T_global:,.1f} °F  |  "
+                        f"physics: {T_phys_F:,.1f} °F  |  oor={out_of_range}  |  k={k}  |  p75 dist={pr75:.2f}"
                     )
 
-                    # Show nearest history
-                    neigh["_dist"] = dist[idx]
-                    st.write("Closest historical runs:")
-                    st.dataframe(
-                        neigh.sort_values("_dist").head(6)[
-                            ["wire_dia","speed_fpm","annealer_ht_ft","dwell_s","anneal_temp_f","_dist"]
-                        ].rename(columns={
-                            "wire_dia":"dia (in)","speed_fpm":"speed (FPM)",
-                            "annealer_ht_ft":"height (ft)","dwell_s":"dwell (s)",
-                            "anneal_temp_f":"temp (°F)","_dist":"distance"
-                        })
-                    )
+                    with st.expander("Closest historical runs"):
+                        neigh["_dist"] = dist[idx]
+                        st.dataframe(
+                            neigh.sort_values("_dist").head(12)[
+                                ["wire_dia","speed_fpm","annealer_ht_ft","dwell_s","anneal_temp_f","_dist"]
+                            ].rename(columns={
+                                "wire_dia":"dia (in)","speed_fpm":"speed (FPM)",
+                                "annealer_ht_ft":"height (ft)","dwell_s":"dwell (s)",
+                                "anneal_temp_f":"temp (°F)","_dist":"distance"
+                            })
+                        )
 
-                    if out_of_range:
-                        st.warning("Inputs are outside the dense region of history. Increased physics blending applied.")
-
-
-
+                    with st.expander("Data QA"):
+                        # quick checks to help catch odd rows
+                        bad_numeric = df[need].isna().sum().sum()
+                        st.write(f"Rows: {len(df)}")
+                        st.write(f"Empty cells across required columns: {bad_numeric}")
+                        st.write("Tip: keep height consistent with your history when testing a neighborhood.")
