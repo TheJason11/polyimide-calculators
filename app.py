@@ -74,8 +74,8 @@ def num_input1(label, value, step, minv, maxv=None):
 # =============================
 # Module: Runtime Calculator
 # =============================
-if page == "RunTime Calculator":
-    st.title("Job RunTime Calculator")
+if page == "Runtime Calculator":
+    st.title("Job Runtime Calculator")
     st.caption("Compute runtime, footage, or rate from feet, time, and speed")
 
     mode = st.radio("Choose calculator",
@@ -426,5 +426,6 @@ elif page == "Anneal Temp Estimator":
 
                     if out_of_range:
                         st.warning("Inputs are outside the dense region of history. Increased physics blending applied.")
+
 
 
