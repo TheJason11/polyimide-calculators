@@ -124,7 +124,7 @@ if page == "Runtime Calculator":
             st.info("Enter minutes greater than zero")
 
 # =============================
-# Module: Copper Wire Converter
+# Module: Cu Wire Converter
 # =============================
 elif page == "Copper Wire Converter":
     st.title("Copper Wire Length ↔ Weight")
@@ -426,3 +426,4 @@ elif page == "Anneal Temp Estimator":
 
                     if out_of_range:
                         st.warning("Inputs are outside the dense region of history. Increased physics blending applied.")
+
