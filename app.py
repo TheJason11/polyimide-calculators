@@ -406,4 +406,177 @@ def anneal_temp_estimator_page():
     with a:
         wire_dia = decimal_input("Wire Diameter (in)", 0.0250, key="an_d", min_value=0.001, max_value=0.200)
     with b:
-        speed = decimal_input("Line Speed (FPM)", 18.0, key="an_s", min_value=_
+        speed = decimal_input("Line Speed (FPM)", 18.0, key="an_s", min_value=1.0, max_value=100.0)
+    with c:
+        height = decimal_input("Annealer Height (ft)", 14.0, key="an_h", min_value=1.0, max_value=50.0)
+
+    st.subheader("Model Configuration")
+    m1, m2, m3, m4 = st.columns(4)
+    with m1:
+        include_outliers = st.checkbox("Include Outliers", value=False)
+    clean_df = df if include_outliers else df[~df['is_outlier']]
+
+    with m2:
+        max_k = min(60, len(clean_df))
+        default_k = min(35, max_k) if max_k >= 35 else max_k
+        k_neighbors = st.slider("Number of Neighbors k", min_value=3, max_value=max_k, value=default_k)
+    with m3:
+        weight_method = st.selectbox("Weighting Method", ["Gaussian", "Distance", "Uniform"], index=0)
+    with m4:
+        oor_gate = st.slider("Out of Range Gate p75 dist z space", min_value=0.5, max_value=3.0, value=1.25, step=0.05)
+
+    if st.button("Predict Temperature", key="anneal_predict"):
+        if None in (wire_dia, speed, height):
+            st.error("Please fill all inputs.")
+            return
+
+        dwell_s = (height / speed) * 60.0
+        ln_d = np.log(clean_df['wire_dia_in'].values)
+        ln_dw = np.log(clean_df['dwell_s'].values)
+        X = np.column_stack([ln_d, -ln_dw]).astype(float)
+        y = clean_df['anneal_temp_f'].values.astype(float)
+
+        mu = X.mean(axis=0)
+        sd = X.std(axis=0, ddof=1)
+        sd[sd == 0] = 1.0
+        Z = (X - mu) / sd
+
+        q_raw = np.array([math.log(wire_dia), -math.log(dwell_s)], dtype=float)
+        qz = (q_raw - mu) / sd
+
+        nn = NearestNeighbors(n_neighbors=k_neighbors, metric='euclidean')
+        nn.fit(Z)
+        D, I = nn.kneighbors(qz.reshape(1, -1))
+        D = D.flatten()
+        I = I.flatten()
+        neigh_temps = y[I]
+
+        eps = 1e-8
+        if weight_method == "Distance":
+            w = 1.0 / (D + eps)
+        elif weight_method == "Gaussian":
+            bw = np.median(D) if np.median(D) > 0 else (np.mean(D) + eps)
+            w = np.exp(-0.5 * (D / (bw + eps)) ** 2)
+        else:
+            w = np.ones_like(D)
+        w = w / (w.sum() + eps)
+        T_knn = float(np.sum(w * neigh_temps))
+
+        lam = 10.0
+        Xg = np.column_stack([np.ones(len(X)), X])
+        G = Xg.T @ Xg + lam * np.eye(Xg.shape[1])
+        beta = np.linalg.solve(G, Xg.T @ y)
+        b0, b_d, b_dwneg = beta.tolist()
+        b_d = max(0.0, b_d)
+        b_dwneg = max(0.0, b_dwneg)
+        mean_y = float(y.mean())
+        mean_X = X.mean(axis=0)
+        b0 = mean_y - b_d * mean_X[0] - b_dwneg * mean_X[1]
+        T_ridge = float(b0 + b_d * q_raw[0] + b_dwneg * q_raw[1])
+
+        pr75 = float(np.percentile(D, 75))
+        out_of_range = pr75 > oor_gate
+
+        ln_d_all = np.log(clean_df['wire_dia_in'].values)
+        ln_dw_all = np.log(clean_df['dwell_s'].values)
+        temps_all = clean_df['anneal_temp_f'].values
+
+        def isotonic_predict(ln_d_q, ln_dw_q, band=0.06, min_n=12):
+            cur_band = band
+            for _ in range(5):
+                mask = np.abs(ln_d_all - ln_d_q) <= cur_band
+                x = -ln_dw_all[mask]
+                yv = temps_all[mask]
+                if x.size >= min_n and np.unique(x).size >= 3:
+                    order = np.argsort(x)
+                    ir = IsotonicRegression(increasing=True, out_of_bounds='clip')
+                    ir.fit(x[order], yv[order])
+                    return float(ir.predict([-ln_dw_q])[0])
+                cur_band *= 1.5
+            return None
+
+        T_iso = isotonic_predict(q_raw[0], -q_raw[1])
+        if T_iso is None:
+            x_local_raw = X[I, 1]
+            y_local = neigh_temps
+            if np.unique(x_local_raw).size >= 3:
+                order = np.argsort(x_local_raw)
+                ir = IsotonicRegression(increasing=True, out_of_bounds='clip')
+                ir.fit(x_local_raw[order], y_local[order])
+                T_iso = float(ir.predict([q_raw[1]])[0])
+
+        if T_iso is not None:
+            T_local = 0.7 * T_iso + 0.3 * T_knn
+        else:
+            T_local = T_knn
+
+        w_local = 0.90 if not out_of_range else 0.70
+        T_mix = w_local * T_local + (1.0 - w_local) * T_ridge
+        T_final = float(np.clip(T_mix, 650.0, 1200.0))
+
+        st.success("Prediction complete.")
+        a, b, c, d = st.columns(4)
+        a.metric("Predicted Temperature", f"{T_final:.1f} °F")
+        b.metric("kNN Core", f"{T_knn:.1f} °F")
+        c.metric("Backbone NNLS", f"{T_ridge:.1f} °F")
+        d.metric("Dwell Time", f"{dwell_s:.1f} s")
+        if T_iso is not None:
+            st.caption("Monotonic guard active.")
+        st.caption(
+            f"Distance stats z space median {np.median(D):.2f}  p75 {pr75:.2f}  out of range {out_of_range}  k {k_neighbors}  weighting {weight_method}"
+        )
+
+        with st.expander("Closest Historical Runs"):
+            neighbor_display = clean_df.iloc[I][['wire_dia_in', 'speed_fpm', 'annealer_ht_ft', 'dwell_s', 'anneal_temp_f']].copy()
+            neighbor_display['Distance'] = D
+            neighbor_display['Weight'] = w
+            neighbor_display = neighbor_display.rename(columns={
+                'wire_dia_in': 'Dia in', 'speed_fpm': 'Speed FPM', 'annealer_ht_ft': 'Height ft',
+                'dwell_s': 'Dwell s', 'anneal_temp_f': 'Temp °F'
+            })
+            st.dataframe(
+                neighbor_display.style.format({
+                    'Dia in': '{:.4f}', 'Speed FPM': '{:.1f}', 'Height ft': '{:.0f}',
+                    'Dwell s': '{:.1f}', 'Temp °F': '{:.0f}', 'Distance': '{:.3f}', 'Weight': '{:.3f}'
+                })
+            )
+
+# ================================
+# MAIN APP
+# ================================
+def main():
+    st.sidebar.title("Zeus Polyimide Process Suite")
+    page = st.sidebar.radio(
+        "Choose a module",
+        [
+            "Wire Diameter Predictor",
+            "Runtime Calculator",
+            "Copper Wire Converter",
+            "Coated Copper Converter",
+            "Anneal Temp Estimator",
+        ],
+        index=0,
+    )
+
+    if page == "Wire Diameter Predictor":
+        wire_diameter_predictor_page()
+    elif page == "Runtime Calculator":
+        runtime_calculator_page()
+    elif page == "Copper Wire Converter":
+        copper_wire_converter_page()
+    elif page == "Coated Copper Converter":
+        coated_copper_converter_page()
+    elif page == "Anneal Temp Estimator":
+        anneal_temp_estimator_page()
+
+    st.sidebar.markdown("---")
+    st.sidebar.info("""
+Zeus Polyimide Process Suite
+
+This build adds a Wire Diameter Predictor that outputs final diameter from starting diameter and process conditions using conservation of volume and a tunable plastic stretch factor. Includes one click alpha calibration from a known run.
+
+Also includes the prior runtime and weight tools, plus the advanced anneal temperature estimator. Decimal typing fix remains active.
+    """)
+
+if __name__ == "__main__":
+    main()
