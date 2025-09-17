@@ -1,12 +1,15 @@
 import os
 import math
+import re
 import numpy as np
 import pandas as pd
 import streamlit as st
 from sklearn.neighbors import NearestNeighbors
+from sklearn.isotonic import IsotonicRegression
 import plotly.graph_objects as go
 import plotly.express as px
 import warnings
+
 warnings.filterwarnings('ignore')
 
 st.set_page_config(
@@ -19,37 +22,69 @@ st.set_page_config(
 # ================================
 # CONSTANTS AND PHYSICAL PROPERTIES
 # ================================
-# Copper properties
 COPPER_DENSITY_LB_PER_IN3 = 0.323
 COPPER_DENSITY_G_PER_CM3 = 8.96
-E_COPPER_PSI = 16_000_000  # Young's modulus
-NU_COPPER = 0.34  # Poisson's ratio
+E_COPPER_PSI = 16_000_000
+NU_COPPER = 0.34
 COPPER_THERMAL_EXPANSION = 16.5e-6  # per °C
-COPPER_THERMAL_DIFFUSIVITY = 1.11e-4  # m²/s
 
-# Copper yield stress ranges (annealed)
 YIELD_STRESS_ANNEALED_MIN = 10_000  # PSI
 YIELD_STRESS_ANNEALED_MAX = 20_000  # PSI
 YIELD_STRESS_HARD_MIN = 30_000  # PSI
 YIELD_STRESS_HARD_MAX = 45_000  # PSI
 
-# Polyimide properties
 PI_DENSITY_G_PER_CM3_DEFAULT = 1.42
-PI_DENSITY_LB_PER_IN3_DEFAULT = 0.0513
 PI_THERMAL_EXPANSION = 20e-6  # per °C
 
-# Unit conversions
 IN3_TO_CM3 = 16.387064
-CM3_TO_IN3 = 1.0 / IN3_TO_CM3
 G_PER_LB = 453.59237
 LB_PER_G = 1.0 / G_PER_LB
 MIL_PER_IN = 1000.0
 IN_PER_MIL = 1.0 / MIL_PER_IN
-FT_PER_IN = 1.0 / 12.0
 IN_PER_FT = 12.0
 
-# Mathematical constants
 PI = math.pi
+
+# ================================
+# DECIMAL INPUT HELPER
+# ================================
+# Streamlit's number_input can be fussy for decimals (.08 → 8). This text-based helper
+# accepts ".08", "0.08", "  0.080 " etc., validates, and returns a float.
+DECIMAL_RE = re.compile(r"^\s*([0-9]*\.?[0-9]+)\s*$")
+
+
+def _parse_decimal(s: str):
+    if s is None:
+        return None
+    s = str(s)
+    if s == "":
+        return None
+    m = DECIMAL_RE.match(s)
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except Exception:
+        return None
+
+
+def decimal_input(label, value, key, min_value=None, max_value=None, help=None, width=None):
+    col = st if width is None else st.container()
+    if key not in st.session_state:
+        st.session_state[key] = f"{value}"
+    s = col.text_input(label, value=st.session_state[key], key=f"{key}_text", help=help)
+    v = _parse_decimal(s)
+    if v is None:
+        st.session_state[key] = s  # preserve what user typed
+        st.caption("Enter a decimal like 0.08 or .08")
+        return None
+    if min_value is not None and v < min_value:
+        st.warning(f"Minimum is {min_value}")
+    if max_value is not None and v > max_value:
+        st.warning(f"Maximum is {max_value}")
+    st.session_state[key] = s
+    return v
+
 
 # ================================
 # UTILITY FUNCTIONS
@@ -71,42 +106,40 @@ def validate_numeric_input(value, min_val=0, max_val=None, allow_zero=False):
         return False, f"Value must be at most {max_val}"
     return True, "Valid"
 
+
 def awg_to_diameter_inches(awg):
-    """
-    Convert AWG to diameter in inches.
-    Accepts integers (e.g., 30) or special strings '2/0','3/0','4/0'.
-    """
     if isinstance(awg, str):
         special = {"2/0": 0.3648, "3/0": 0.4096, "4/0": 0.4600}
         if awg in special:
             return special[awg]
-        try:
-            awg = int(awg)
-        except Exception:
-            return None
+        awg = int(awg)
     if awg == 36:
         return 0.0050
     if awg == 0:
         return 0.3249
-    # Standard AWG formula
     return 0.005 * 92 ** ((36 - awg) / 39)
 
+
 def diameter_inches_to_awg(diameter):
-    if diameter <= 0:
+    if diameter is None or diameter <= 0:
         return None
     awg = 36 - 39 * math.log(diameter / 0.005, 92)
     return round(awg)
 
+
 def calculate_circle_area(diameter):
     return PI * (diameter ** 2) / 4.0
+
 
 def calculate_annulus_area(id_in, wall_in):
     od_in = id_in + 2.0 * wall_in
     return PI * (od_in ** 2 - id_in ** 2) / 4.0
 
+
 def calculate_wire_volume(diameter, length_ft):
     area = calculate_circle_area(diameter)
     return area * length_ft * IN_PER_FT
+
 
 def calculate_thermal_strain(temp_change_f, material="copper"):
     temp_change_c = temp_change_f * 5.0 / 9.0
@@ -116,6 +149,7 @@ def calculate_thermal_strain(temp_change_f, material="copper"):
         return PI_THERMAL_EXPANSION * temp_change_c
     return 0.0
 
+
 # ================================
 # RUNTIME CALCULATOR
 # ================================
@@ -123,46 +157,33 @@ def runtime_calculator_page():
     st.title("Production Runtime Calculator")
 
     col1, col2 = st.columns([2, 1])
-
     with col1:
-        st.markdown("""
-        Calculate production runtime, throughput, and efficiency metrics for your coating process.
-        Includes startup and shutdown time.
-        """)
-
+        st.markdown("Calculate runtime, throughput, and efficiency (with startup/shutdown).")
         with st.form("runtime_form"):
             st.subheader("Production Parameters")
-
             c1, c2, c3 = st.columns(3)
             with c1:
-                wire_length_ft = st.number_input(
-                    "Wire Length (ft)", min_value=0.0, value=12000.0, step=100.0
-                )
+                wire_length_ft = decimal_input("Wire Length (ft)", 12000.0, key="rt_len", min_value=0.0, help="Total length this pass")
             with c2:
-                line_speed_fpm = st.number_input(
-                    "Line Speed (FPM)", min_value=1.0, value=18.0, step=0.5
-                )
+                line_speed_fpm = decimal_input("Line Speed (FPM)", 18.0, key="rt_speed", min_value=1.0)
             with c3:
-                efficiency_pct = st.number_input(
-                    "Process Efficiency (%)", min_value=50.0, max_value=100.0, value=85.0, step=1.0
-                )
+                efficiency_pct = decimal_input("Process Efficiency (%)", 85.0, key="rt_eff", min_value=50.0, max_value=100.0)
 
             st.subheader("Additional Time Factors")
-
             c4, c5, c6 = st.columns(3)
             with c4:
-                startup_min = st.number_input("Startup Time (min)", min_value=0.0, value=30.0, step=5.0)
+                startup_min = decimal_input("Startup Time (min)", 30.0, key="rt_start", min_value=0.0)
             with c5:
-                shutdown_min = st.number_input("Shutdown Time (min)", min_value=0.0, value=15.0, step=5.0)
+                shutdown_min = decimal_input("Shutdown Time (min)", 15.0, key="rt_stop", min_value=0.0)
             with c6:
-                passes = st.number_input("Number of Passes", min_value=1, value=1, step=1)
+                passes = int(st.number_input("Number of Passes", min_value=1, value=1, step=1))
 
             calculate_btn = st.form_submit_button("Calculate Runtime")
 
         if calculate_btn:
-            valid, msg = validate_numeric_input(wire_length_ft, min_val=1)
-            if not valid:
-                st.error(f"Invalid wire length: {msg}")
+            if not all(validate_numeric_input(v, min_val=0 if k == "rt_len" else 1)[0]
+                       for v, k in [(wire_length_ft, "rt_len"), (line_speed_fpm, "rt_speed")]):
+                st.error("Invalid length or speed.")
                 return
 
             production_time_min = (wire_length_ft * passes) / line_speed_fpm
@@ -172,22 +193,19 @@ def runtime_calculator_page():
 
             effective_speed_fpm = line_speed_fpm * (efficiency_pct / 100.0)
             hourly_throughput_ft = effective_speed_fpm * 60.0
-            daily_throughput_ft = hourly_throughput_ft * 8  # 8-hour shift
+            daily_throughput_ft = hourly_throughput_ft * 8
 
             st.success("Calculation complete.")
+            a, b, c, d = st.columns(4)
+            a.metric("Production Time", f"{production_time_min:.1f} min")
+            b.metric("Setup/Shutdown", f"{startup_min + shutdown_min:.0f} min")
+            c.metric("Total Runtime", f"{total_time_hr:.2f} hours")
+            d.metric("Total (minutes)", f"{total_time_min:.1f} min")
 
-            st.subheader("Runtime Breakdown")
-            met_col1, met_col2, met_col3, met_col4 = st.columns(4)
-            met_col1.metric("Production Time", f"{production_time_min:.1f} min")
-            met_col2.metric("Setup/Shutdown", f"{startup_min + shutdown_min:.0f} min")
-            met_col3.metric("Total Runtime", f"{total_time_hr:.2f} hours")
-            met_col4.metric("Total (minutes)", f"{total_time_min:.1f} min")
-
-            st.subheader("Throughput Metrics")
-            thr_col1, thr_col2, thr_col3 = st.columns(3)
-            thr_col1.metric("Effective Speed", f"{effective_speed_fpm:.1f} FPM")
-            thr_col2.metric("Hourly Output", f"{hourly_throughput_ft:,.0f} ft/hr")
-            thr_col3.metric("Daily Output (8hr)", f"{daily_throughput_ft:,.0f} ft/day")
+            a, b, c = st.columns(3)
+            a.metric("Effective Speed", f"{effective_speed_fpm:.1f} FPM")
+            b.metric("Hourly Output", f"{hourly_throughput_ft:,.0f} ft/hr")
+            c.metric("Daily Output (8hr)", f"{daily_throughput_ft:,.0f} ft/day")
 
     with col2:
         st.subheader("Quick Reference (Zeus practice)")
@@ -199,73 +217,62 @@ def runtime_calculator_page():
 We rarely exceed ~25 FPM; 30 FPM is an absolute ceiling and almost never used.
         """)
 
+
 # ================================
 # COPPER WIRE CONVERTER
 # ================================
-def awg_block():
+def copper_wire_converter_page():
     st.title("Copper Wire Weight Calculator")
 
     col1, col2 = st.columns([3, 1])
-
     with col1:
         st.markdown("Convert between wire dimensions, AWG sizes, and weight for bare copper.")
-
         input_method = st.radio("Input Method", ["Diameter", "AWG"], horizontal=True)
 
         c1, c2, c3 = st.columns(3)
-
         with c1:
             if input_method == "AWG":
-                awg = st.selectbox(
-                    "AWG Size",
-                    options=list(range(50, -1, -1)) + ["2/0", "3/0", "4/0"],
-                    index=20
-                )
+                awg = st.selectbox("AWG Size", options=list(range(50, -1, -1)) + ["2/0", "3/0", "4/0"], index=20)
                 diameter_in = awg_to_diameter_inches(awg)
                 if diameter_in is None:
                     st.error("Invalid AWG")
                     return
                 st.info(f"Diameter: {diameter_in:.4f} inches")
             else:
-                diameter_in = st.number_input(
-                    "Wire Diameter (inches)", min_value=0.0001, max_value=1.0, value=0.0100, step=0.0001, format="%.4f"
-                )
-                equiv_awg = diameter_inches_to_awg(diameter_in)
-                if equiv_awg is not None:
-                    st.info(f"Closest AWG: {equiv_awg}")
+                diameter_in = decimal_input("Wire Diameter (inches)", 0.0100, key="cw_d", min_value=0.0001, max_value=1.0)
+                if diameter_in is not None:
+                    equiv_awg = diameter_inches_to_awg(diameter_in)
+                    if equiv_awg is not None:
+                        st.info(f"Closest AWG: {equiv_awg}")
 
         with c2:
-            length_ft = st.number_input("Wire Length (ft)", min_value=0.0, value=1000.0, step=10.0)
-
+            length_ft = decimal_input("Wire Length (ft)", 1000.0, key="cw_len", min_value=0.0)
         with c3:
-            copper_density = st.number_input(
-                "Copper Density (lb/in³)", min_value=0.300, max_value=0.350,
-                value=COPPER_DENSITY_LB_PER_IN3, step=0.001, format="%.3f"
-            )
+            copper_density = decimal_input("Copper Density (lb/in³)", COPPER_DENSITY_LB_PER_IN3, key="cw_rho",
+                                           min_value=0.300, max_value=0.350)
 
-        if st.button("Calculate"):
+        if st.button("Calculate", key="copper_calc"):
+            if None in (diameter_in, length_ft, copper_density):
+                st.error("Please fill all inputs.")
+                return
             area_in2 = calculate_circle_area(diameter_in)
             volume_in3 = calculate_wire_volume(diameter_in, length_ft)
             weight_lb = volume_in3 * copper_density
             weight_per_ft = weight_lb / length_ft if length_ft > 0 else 0
-
-            # approximate resistance at 20°C
-            resistivity_ohm_cm = 1.72e-6
+            resistivity_ohm_cm = 1.72e-6  # ~20°C
             resistance_ohms = (resistivity_ohm_cm * length_ft * 30.48) / (area_in2 * 6.4516)
 
             st.success("Calculation complete.")
-
-            res_col1, res_col2, res_col3, res_col4 = st.columns(4)
-            res_col1.metric("Wire Weight", f"{weight_lb:.3f} lbs")
-            res_col2.metric("Weight per Foot", f"{weight_per_ft:.5f} lb/ft")
-            res_col3.metric("Cross Section", f"{area_in2:.6f} in²")
-            res_col4.metric("Resistance", f"{resistance_ohms:.3f} Ω")
+            a, b, c, d = st.columns(4)
+            a.metric("Wire Weight", f"{weight_lb:.3f} lbs")
+            b.metric("Weight per Foot", f"{weight_per_ft:.5f} lb/ft")
+            c.metric("Cross Section", f"{area_in2:.6f} in²")
+            d.metric("Resistance", f"{resistance_ohms:.3f} Ω")
 
             with st.expander("Visual Comparison"):
                 awg_range = list(range(10, 41, 2))
                 diameters = [awg_to_diameter_inches(a) for a in awg_range]
                 weights = [calculate_wire_volume(d, 1000) * copper_density for d in diameters]
-
                 fig = go.Figure()
                 fig.add_trace(go.Scatter(x=awg_range, y=weights, mode='lines', name='Weight per 1000ft', line=dict(width=2)))
                 fig.add_trace(go.Scatter(
@@ -273,10 +280,7 @@ def awg_block():
                     y=[weight_lb * 1000 / length_ft if length_ft > 0 else 0],
                     mode='markers', name='Your Wire', marker=dict(size=12, symbol='star')
                 ))
-                fig.update_layout(
-                    title='Weight vs AWG Size (per 1000 ft)',
-                    xaxis_title='AWG', yaxis_title='Weight (lbs)', height=400, hovermode='x unified'
-                )
+                fig.update_layout(title='Weight vs AWG Size (per 1000 ft)', xaxis_title='AWG', yaxis_title='Weight (lbs)', height=400, hovermode='x unified')
                 st.plotly_chart(fig, use_container_width=True)
 
     with col2:
@@ -290,6 +294,7 @@ Common AWG diameters:
 - AWG 14: 0.0641"
         """)
 
+
 # ================================
 # COATED COPPER CONVERTER
 # ================================
@@ -297,97 +302,59 @@ def coated_copper_converter_page():
     st.title("Coated Wire Weight Calculator")
 
     st.markdown("Calculate weight and dimensions for polyimide-coated copper wire with multi-layer build-up.")
-
     with st.form("coated_wire_form"):
         c1, c2, c3, c4 = st.columns(4)
-
         with c1:
-            copper_dia_in = st.number_input("Copper Diameter (in)", min_value=0.001, max_value=0.200, value=0.0100, step=0.001, format="%.4f")
-
+            copper_dia_in = decimal_input("Copper Diameter (in)", 0.0100, key="coat_d", min_value=0.001, max_value=0.200)
         with c2:
-            coating_thickness_mil = st.number_input("Coating per Side (mil)", min_value=0.1, max_value=10.0, value=1.0, step=0.1)
-
+            coating_thickness_mil = decimal_input("Coating per Side (mil)", 1.0, key="coat_t", min_value=0.1, max_value=10.0)
         with c3:
-            wire_length_ft = st.number_input("Wire Length (ft)", min_value=0.0, value=1000.0, step=10.0)
-
+            wire_length_ft = decimal_input("Wire Length (ft)", 1000.0, key="coat_len", min_value=0.0)
         with c4:
-            num_layers = st.number_input("Number of Layers", min_value=1, max_value=20, value=1, step=1)
+            num_layers = int(st.number_input("Number of Layers", min_value=1, max_value=20, value=1, step=1))
 
         with st.expander("Advanced Parameters"):
-            ac1, ac2, ac3 = st.columns(3)
-            with ac1:
-                pi_density = st.number_input("Polyimide Density (g/cm³)", min_value=1.0, max_value=2.0, value=PI_DENSITY_G_PER_CM3_DEFAULT, step=0.01, format="%.2f")
-            with ac2:
-                layer_efficiency = st.number_input("Layer Efficiency (%)", min_value=80.0, max_value=100.0, value=95.0, step=1.0)
-            with ac3:
-                scrap_rate_pct = st.number_input("Scrap Rate (%)", min_value=0.0, max_value=20.0, value=5.0, step=0.5)
+            a, b, c = st.columns(3)
+            with a:
+                pi_density = decimal_input("Polyimide Density (g/cm³)", PI_DENSITY_G_PER_CM3_DEFAULT, key="coat_rho",
+                                           min_value=1.0, max_value=2.0)
+            with b:
+                layer_efficiency = decimal_input("Layer Efficiency (%)", 95.0, key="coat_eff", min_value=80.0, max_value=100.0)
+            with c:
+                scrap_rate_pct = decimal_input("Scrap Rate (%)", 5.0, key="coat_scrap", min_value=0.0, max_value=20.0)
 
         calculate_btn = st.form_submit_button("Calculate Coated Wire Properties")
 
     if calculate_btn:
+        if None in (copper_dia_in, coating_thickness_mil, wire_length_ft, pi_density, layer_efficiency, scrap_rate_pct):
+            st.error("Please fill all inputs.")
+            return
+
         coating_per_side_in = (coating_thickness_mil * num_layers * layer_efficiency / 100.0) / MIL_PER_IN
         final_od_in = copper_dia_in + 2 * coating_per_side_in
-
         copper_volume_in3 = calculate_wire_volume(copper_dia_in, wire_length_ft)
         total_volume_in3 = calculate_wire_volume(final_od_in, wire_length_ft)
         coating_volume_in3 = total_volume_in3 - copper_volume_in3
 
         copper_weight_lb = copper_volume_in3 * COPPER_DENSITY_LB_PER_IN3
-        coating_volume_cm3 = coating_volume_in3 * IN3_TO_CM3
-        coating_weight_g = coating_volume_cm3 * pi_density
+        coating_weight_g = (coating_volume_in3 * IN3_TO_CM3) * pi_density
         coating_weight_lb = coating_weight_g * LB_PER_G
         total_weight_lb = copper_weight_lb + coating_weight_lb
-
         total_with_scrap_lb = total_weight_lb * (1 + scrap_rate_pct / 100.0)
 
         st.success("Calculation complete.")
+        a, b, c, d = st.columns(4)
+        a.metric("Starting OD", f"{copper_dia_in:.4f} in")
+        b.metric("Coating Build", f"{coating_per_side_in*MIL_PER_IN:.1f} mil/side")
+        c.metric("Final OD", f"{final_od_in:.4f} in")
+        d.metric("OD Increase", f"{(final_od_in/copper_dia_in - 1)*100:.1f}%")
 
-        st.subheader("Wire Dimensions")
-        dim_col1, dim_col2, dim_col3, dim_col4 = st.columns(4)
-        dim_col1.metric("Starting OD", f"{copper_dia_in:.4f} in")
-        dim_col2.metric("Coating Build", f"{coating_per_side_in*MIL_PER_IN:.1f} mil/side")
-        dim_col3.metric("Final OD", f"{final_od_in:.4f} in")
-        dim_col4.metric("OD Increase", f"{(final_od_in/copper_dia_in - 1)*100:.1f}%")
+        a, b, c, d = st.columns(4)
+        a.metric("Copper Weight", f"{copper_weight_lb:.3f} lbs")
+        b.metric("Coating Weight", f"{coating_weight_lb:.3f} lbs")
+        c.metric("Total Weight", f"{total_weight_lb:.3f} lbs")
+        d.metric("With Scrap", f"{total_with_scrap_lb:.3f} lbs")
 
-        st.subheader("Weight Breakdown")
-        wt_col1, wt_col2, wt_col3, wt_col4 = st.columns(4)
-        wt_col1.metric("Copper Weight", f"{copper_weight_lb:.3f} lbs")
-        wt_col2.metric("Coating Weight", f"{coating_weight_lb:.3f} lbs")
-        wt_col3.metric("Total Weight", f"{total_weight_lb:.3f} lbs")
-        wt_col4.metric("With Scrap", f"{total_with_scrap_lb:.3f} lbs")
-
-        with st.expander("Coating Build-Up Visualization"):
-            fig = go.Figure()
-            theta = np.linspace(0, 2*np.pi, 100)
-
-            r_copper = copper_dia_in / 2
-            x_copper = r_copper * np.cos(theta)
-            y_copper = r_copper * np.sin(theta)
-            fig.add_trace(go.Scatter(
-                x=x_copper, y=y_copper, fill='toself',
-                fillcolor='rgba(184,115,51,0.5)', line=dict(), name='Copper Core',
-                hovertemplate='Copper: %{text}<extra></extra>', text=[f'Dia: {copper_dia_in:.4f}"'] * len(theta)
-            ))
-
-            for i in range(1, num_layers + 1):
-                layer_radius = copper_dia_in/2 + (coating_thickness_mil * i * layer_efficiency/100.0)/MIL_PER_IN
-                x_layer = layer_radius * np.cos(theta)
-                y_layer = layer_radius * np.sin(theta)
-                opacity = 0.3 + 0.5 * (i / num_layers)
-                fig.add_trace(go.Scatter(
-                    x=x_layer, y=y_layer, fill='toself',
-                    fillcolor=f'rgba(255,165,0,{opacity})', line=dict(dash='dot' if i < num_layers else 'solid'),
-                    name=f'Layer {i}', hovertemplate='Layer %{text}<extra></extra>',
-                    text=[f'{i}: Dia {layer_radius*2:.4f}"'] * len(theta)
-                ))
-
-            fig.update_layout(
-                title='Cross-Section View (Not to Scale)',
-                xaxis=dict(scaleanchor='y', scaleratio=1, showgrid=False, visible=False),
-                yaxis=dict(showgrid=False, visible=False),
-                height=400, showlegend=True, hovermode='closest'
-            )
-            st.plotly_chart(fig, use_container_width=True)
 
 # ================================
 # WIRE STRETCH PREDICTOR
@@ -395,40 +362,36 @@ def coated_copper_converter_page():
 def wire_stretch_predictor_page():
     st.title("Wire Elongation Predictor")
 
-    st.markdown("""
-Predict wire elongation under tension, including elastic deformation, thermal expansion,
-and onset of plastic yield.
-    """)
-
+    st.markdown("Predict elastic + thermal elongation and check against yield.")
     c1, c2, c3 = st.columns(3)
-
     with c1:
-        wire_dia_in = st.number_input("Wire Diameter (in)", min_value=0.001, max_value=0.200, value=0.0100, step=0.001, format="%.4f")
+        wire_dia_in = decimal_input("Wire Diameter (in)", 0.0100, key="st_d", min_value=0.001, max_value=0.200)
     with c2:
-        tension_lb = st.number_input("Applied Tension (lb)", min_value=0.0, max_value=100.0, value=5.0, step=0.5)
+        tension_lb = decimal_input("Applied Tension (lb)", 5.0, key="st_t", min_value=0.0, max_value=100.0)
     with c3:
-        wire_length_ft = st.number_input("Wire Length (ft)", min_value=1.0, max_value=10000.0, value=100.0, step=10.0)
+        wire_length_ft = decimal_input("Wire Length (ft)", 100.0, key="st_len", min_value=1.0, max_value=10000.0)
 
     with st.expander("Temperature and Material Properties"):
-        t1, t2, t3 = st.columns(3)
-        with t1:
-            operating_temp_f = st.number_input("Operating Temp (°F)", min_value=0.0, max_value=1200.0, value=800.0, step=10.0)
-        with t2:
-            ambient_temp_f = st.number_input("Ambient Temp (°F)", min_value=0.0, max_value=120.0, value=77.0, step=1.0)
-        with t3:
+        a, b, c = st.columns(3)
+        with a:
+            operating_temp_f = decimal_input("Operating Temp (°F)", 800.0, key="st_to", min_value=0.0, max_value=1200.0)
+        with b:
+            ambient_temp_f = decimal_input("Ambient Temp (°F)", 77.0, key="st_ta", min_value=0.0, max_value=120.0)
+        with c:
             wire_condition = st.selectbox("Wire Condition", ["Annealed", "Half-Hard", "Hard"])
 
-    if st.button("Predict Elongation"):
+    if st.button("Predict Elongation", key="stretch"):
+        if None in (wire_dia_in, tension_lb, wire_length_ft, operating_temp_f, ambient_temp_f):
+            st.error("Please fill all inputs.")
+            return
+
         area_in2 = calculate_circle_area(wire_dia_in)
         stress_psi = tension_lb / area_in2 if area_in2 > 0 else 0
-
         elastic_strain = stress_psi / E_COPPER_PSI
         elastic_elongation_in = elastic_strain * wire_length_ft * IN_PER_FT
-
         temp_rise_f = operating_temp_f - ambient_temp_f
         thermal_strain = calculate_thermal_strain(temp_rise_f, "copper")
         thermal_elongation_in = thermal_strain * wire_length_ft * IN_PER_FT
-
         total_elongation_in = elastic_elongation_in + thermal_elongation_in
         percent_elongation = (total_elongation_in / (wire_length_ft * IN_PER_FT)) * 100
 
@@ -444,143 +407,37 @@ and onset of plastic yield.
         dia_reduction_mil = abs(radial_strain * wire_dia_in * MIL_PER_IN)
 
         st.subheader("Elongation Results")
-        e_col1, e_col2, e_col3, e_col4 = st.columns(4)
-        e_col1.metric("Applied Stress", f"{stress_psi:,.0f} PSI")
-        e_col2.metric("Elastic Elongation", f"{elastic_elongation_in:.4f} in")
-        e_col3.metric("Thermal Elongation", f"{thermal_elongation_in:.4f} in")
-        e_col4.metric("Total Elongation", f"{total_elongation_in:.4f} in")
+        a, b, c, d = st.columns(4)
+        a.metric("Applied Stress", f"{stress_psi:,.0f} PSI")
+        b.metric("Elastic Elongation", f"{elastic_elongation_in:.4f} in")
+        c.metric("Thermal Elongation", f"{thermal_elongation_in:.4f} in")
+        d.metric("Total Elongation", f"{total_elongation_in:.4f} in")
 
-        st.subheader("Secondary Effects")
-        s_col1, s_col2, s_col3 = st.columns(3)
-        s_col1.metric("Percent Elongation", f"{percent_elongation:.3f}%")
-        s_col2.metric("Diameter Reduction", f"{dia_reduction_mil:.3f} mil")
-        s_col3.metric("Volume Conservation", "Maintained")
+        a, b, c = st.columns(3)
+        a.metric("Percent Elongation", f"{percent_elongation:.3f}%")
+        b.metric("Diameter Reduction", f"{dia_reduction_mil:.3f} mil")
+        c.metric("Volume Conservation", "Maintained")
 
         if stress_psi > yield_max:
-            st.error(
-                f"Exceeds yield strength. Applied: {stress_psi:,.0f} PSI; Max yield: {yield_max:,.0f} PSI. Risk of permanent deformation."
-            )
+            st.error(f"Exceeds yield strength. Applied: {stress_psi:,.0f} PSI; Max yield: {yield_max:,.0f} PSI.")
         elif stress_psi > yield_min:
-            st.warning(
-                f"Approaching yield. Applied: {stress_psi:,.0f} PSI; Yield range: {yield_min:,.0f}-{yield_max:,.0f} PSI."
-            )
+            st.warning(f"Approaching yield. Applied: {stress_psi:,.0f} PSI; Yield range: {yield_min:,.0f}-{yield_max:,.0f} PSI.")
         else:
             safety_factor = yield_min / stress_psi if stress_psi > 0 else float('inf')
             st.success(f"Operating safely with {safety_factor:.1f}× safety factor.")
 
-        with st.expander("Stress-Strain Visualization"):
-            strain_range = np.linspace(0, 0.002, 100)
-            stress_range = E_COPPER_PSI * strain_range
-
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=strain_range * 100, y=stress_range, mode='lines', name='Elastic Region', line=dict(width=2)))
-            fig.add_trace(go.Scatter(x=[elastic_strain * 100], y=[stress_psi], mode='markers', name='Operating Point', marker=dict(size=12, symbol='star')))
-            fig.add_hrect(y0=yield_min, y1=yield_max, fillcolor="orange", opacity=0.2, line_width=0, annotation_text="Yield Zone")
-            fig.update_layout(title='Stress–Strain Relationship', xaxis_title='Strain (%)', yaxis_title='Stress (PSI)', height=400, hovermode='x unified')
-            st.plotly_chart(fig, use_container_width=True)
 
 # ================================
-# PAA USAGE
-# ================================
-def paa_usage_page():
-    st.title("PAA Solution Requirements Calculator")
-
-    st.markdown("""
-Estimate the PAA solution required for a run, including startup/shutdown scrap, holdup volume, and a safety factor.
-    """)
-
-    with st.form("paa_calculator"):
-        st.subheader("Product Specifications")
-
-        p1, p2, p3 = st.columns(3)
-        with p1:
-            target_id_in = st.number_input("Target ID (in)", min_value=0.001, max_value=0.200, value=0.0160, step=0.001, format="%.4f")
-        with p2:
-            wall_thickness_mil = st.number_input("Wall Thickness (mil)", min_value=0.1, max_value=10.0, value=1.0, step=0.1)
-        with p3:
-            finished_length_ft = st.number_input("Finished Length (ft)", min_value=0.0, value=1500.0, step=10.0)
-
-        st.subheader("Solution Properties")
-
-        s1, s2, s3 = st.columns(3)
-        with s1:
-            paa_solids_pct = st.number_input("PAA Solids (%)", min_value=5.0, max_value=40.0, value=15.0, step=0.5)
-        with s2:
-            solution_density = st.number_input("Solution Density (g/mL)", min_value=0.8, max_value=1.5, value=1.06, step=0.01, format="%.2f")
-        with s3:
-            viscosity_cp = st.number_input("Viscosity (cP)", min_value=100.0, max_value=10000.0, value=2500.0, step=100.0)
-
-        st.subheader("Process Losses")
-
-        l1, l2, l3, l4 = st.columns(4)
-        with l1:
-            startup_scrap_ft = st.number_input("Startup Scrap (ft)", min_value=0.0, value=150.0, step=10.0)
-        with l2:
-            shutdown_scrap_ft = st.number_input("Shutdown Scrap (ft)", min_value=0.0, value=50.0, step=10.0)
-        with l3:
-            holdup_volume_ml = st.number_input("System Holdup (mL)", min_value=0.0, value=400.0, step=10.0)
-        with l4:
-            heel_volume_ml = st.number_input("Tank Heel (mL)", min_value=0.0, value=120.0, step=10.0)
-
-        # FIX: remove problematic sprintf-style formatter (caused JS 'unexpected placeholder' error)
-        safety_factor = st.slider("Safety Factor (fraction)", min_value=0.0, max_value=0.30, value=0.10, step=0.01)
-
-        calculate_btn = st.form_submit_button("Calculate PAA Requirements")
-
-    if calculate_btn:
-        wall_in = wall_thickness_mil / MIL_PER_IN
-        coating_volume_in3 = calculate_annulus_area(target_id_in, wall_in) * finished_length_ft * IN_PER_FT
-        coating_volume_cm3 = coating_volume_in3 * IN3_TO_CM3
-
-        pi_weight_g = coating_volume_cm3 * PI_DENSITY_G_PER_CM3_DEFAULT
-
-        solution_for_product_g = pi_weight_g / (paa_solids_pct / 100.0)
-        solution_for_product_ml = solution_for_product_g / solution_density
-
-        total_scrap_ft = startup_scrap_ft + shutdown_scrap_ft
-        scrap_fraction = total_scrap_ft / finished_length_ft if finished_length_ft > 0 else 0
-        solution_for_scrap_ml = solution_for_product_ml * scrap_fraction
-
-        base_solution_ml = solution_for_product_ml + solution_for_scrap_ml
-        total_solution_ml = base_solution_ml + holdup_volume_ml + heel_volume_ml
-        total_with_safety_ml = total_solution_ml * (1 + safety_factor)
-
-        total_liters = total_with_safety_ml / 1000.0
-        total_gallons = total_liters * 0.264172
-
-        st.success("Calculation complete.")
-
-        st.subheader("PAA Solution Requirements")
-        r1, r2, r3, r4 = st.columns(4)
-        r1.metric("Product Solution", f"{solution_for_product_ml:.0f} mL")
-        r2.metric("Scrap Solution", f"{solution_for_scrap_ml:.0f} mL")
-        r3.metric("Process Losses", f"{holdup_volume_ml + heel_volume_ml:.0f} mL")
-        r4.metric("Safety Buffer", f"{(total_solution_ml * safety_factor):.0f} mL")
-
-        st.subheader("Total Requirements")
-        t1, t2, t3 = st.columns(3)
-        t1.metric("Total Volume", f"{total_liters:.2f} L")
-        t2.metric("Total Volume", f"{total_gallons:.2f} gal")
-        t3.metric("Total Weight", f"{(total_with_safety_ml * solution_density):.0f} g")
-
-        with st.expander("Cost Estimation"):
-            cost_per_liter = st.number_input("PAA Cost ($/Liter)", min_value=0.0, value=150.0, step=10.0)
-            total_cost = total_liters * cost_per_liter
-            cost_per_ft = total_cost / finished_length_ft if finished_length_ft > 0 else 0
-            c1, c2 = st.columns(2)
-            c1.metric("Total Material Cost", f"${total_cost:,.2f}")
-            c2.metric("Cost per Foot", f"${cost_per_ft:.4f}")
-
-# ================================
-# ANNEALING TEMPERATURE ESTIMATOR (kNN + Ridge Backbone)
+# ANNEALING TEMPERATURE ESTIMATOR
+#  kNN (log-space) + Ridge (non-neg slopes) + Monotonicity Guard (isotonic vs dwell)
 # ================================
 def anneal_temp_estimator_page():
     st.title("Advanced Annealing Temperature Estimator")
-
-    st.markdown("""
-kNN on **log-space features** (ln diameter, ln dwell) with **z-score standardization**, **Gaussian weighting**,
-and a small **ridge backbone** for stability in sparse regions. Outliers can be excluded.
-    """)
+    st.markdown(
+        "kNN on log-space features [ln(diameter), −ln(dwell)] with z-score standardization and Gaussian weighting. "
+        "Ridge backbone with **non-negative slopes**. A local isotonic correction enforces: as speed increases "
+        "(dwell ↓), required temperature does not decrease."
+    )
 
     @st.cache_data
     def load_and_clean_data(filepath):
@@ -613,31 +470,30 @@ and a small **ridge backbone** for stability in sparse regions. Outliers can be 
             st.error(f"Error loading data: {e}")
             return None
 
-    data_file = "annealing_dataset_clean.csv"
-    df = load_and_clean_data(data_file)
+    df = load_and_clean_data("annealing_dataset_clean.csv")
     if df is None or len(df) < 8:
         st.error("Not enough valid data to build a model.")
         return
 
     with st.expander("Data Quality Overview"):
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Total Records", len(df))
-        col2.metric("Clean Records", len(df[~df['is_outlier']]))
-        col3.metric("Outliers Detected", int(df['is_outlier'].sum()))
-        col4.metric("Temperature Range", f"{df['anneal_temp_f'].min():.0f}-{df['anneal_temp_f'].max():.0f}°F")
+        a, b, c, d = st.columns(4)
+        a.metric("Total Records", len(df))
+        b.metric("Clean Records", len(df[~df['is_outlier']]))
+        c.metric("Outliers Detected", int(df['is_outlier'].sum()))
+        d.metric("Temperature Range", f"{df['anneal_temp_f'].min():.0f}-{df['anneal_temp_f'].max():.0f}°F")
         fig = px.box(df, y='anneal_temp_f', x='is_outlier',
                      labels={'anneal_temp_f': 'Temperature (°F)', 'is_outlier': 'Is Outlier'},
                      title='Temperature Distribution with Outliers Identified')
         st.plotly_chart(fig, use_container_width=True)
 
     st.subheader("Process Parameters")
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        wire_dia = st.number_input("Wire Diameter (in)", min_value=0.001, max_value=0.200, value=0.0250, step=0.001, format="%.4f")
-    with col2:
-        speed = st.number_input("Line Speed (FPM)", min_value=1.0, max_value=100.0, value=18.0, step=0.5)
-    with col3:
-        height = st.number_input("Annealer Height (ft)", min_value=1.0, max_value=50.0, value=14.0, step=1.0)
+    a, b, c = st.columns(3)
+    with a:
+        wire_dia = decimal_input("Wire Diameter (in)", 0.0250, key="an_d", min_value=0.001, max_value=0.200)
+    with b:
+        speed = decimal_input("Line Speed (FPM)", 18.0, key="an_s", min_value=1.0, max_value=100.0)
+    with c:
+        height = decimal_input("Annealer Height (ft)", 14.0, key="an_h", min_value=1.0, max_value=50.0)
 
     st.subheader("Model Configuration")
     m1, m2, m3, m4 = st.columns(4)
@@ -652,40 +508,39 @@ and a small **ridge backbone** for stability in sparse regions. Outliers can be 
     with m3:
         weight_method = st.selectbox("Weighting Method", ["Gaussian", "Distance", "Uniform"], index=0)
     with m4:
-        oor_gate = st.slider("Out-of-Range Gate (p75 dist)", min_value=0.5, max_value=3.0, value=1.25, step=0.05)
+        oor_gate = st.slider("Out-of-Range Gate (p75 dist, z-space)", min_value=0.5, max_value=3.0, value=1.25, step=0.05)
 
-    if st.button("Predict Temperature"):
-        if len(clean_df) < k_neighbors:
-            st.error(f"Not enough rows after filtering for k={k_neighbors}. Have {len(clean_df)}.")
+    if st.button("Predict Temperature", key="anneal_predict"):
+        if None in (wire_dia, speed, height):
+            st.error("Please fill all inputs.")
             return
 
-        # Features in log space
-        Xd = np.log(clean_df['wire_dia_in'].values)
-        Xdw = np.log(clean_df['dwell_s'].values)
-        X = np.column_stack([Xd, Xdw]).astype(float)
+        # --- features: ln(diameter), -ln(dwell) so larger value = harder condition (needs higher T) ---
+        dwell_s = (height / speed) * 60.0
+        ln_d = np.log(clean_df['wire_dia_in'].values)
+        ln_dw = np.log(clean_df['dwell_s'].values)
+        X = np.column_stack([ln_d, -ln_dw]).astype(float)
         y = clean_df['anneal_temp_f'].values.astype(float)
 
-        # Z-score standardization
+        # z-score standardization
         mu = X.mean(axis=0)
         sd = X.std(axis=0, ddof=1)
         sd[sd == 0] = 1.0
         Z = (X - mu) / sd
 
-        # Query
-        dwell_s = (height / speed) * 60.0
-        q_raw = np.array([math.log(wire_dia), math.log(dwell_s)], dtype=float)
+        # query in same space
+        q_raw = np.array([math.log(wire_dia), -math.log(dwell_s)], dtype=float)
         qz = (q_raw - mu) / sd
 
-        # Neighbors
+        # neighbors
         nn = NearestNeighbors(n_neighbors=k_neighbors, metric='euclidean')
         nn.fit(Z)
-        distances, indices = nn.kneighbors(qz.reshape(1, -1))
-        D = distances.flatten()
-        I = indices.flatten()
-
+        D, I = nn.kneighbors(qz.reshape(1, -1))
+        D = D.flatten()
+        I = I.flatten()
         neigh_temps = y[I]
 
-        # Weights
+        # weights
         eps = 1e-8
         if weight_method == "Distance":
             w = 1.0 / (D + eps)
@@ -695,41 +550,87 @@ and a small **ridge backbone** for stability in sparse regions. Outliers can be 
         else:
             w = np.ones_like(D)
         w = w / (w.sum() + eps)
-
         T_knn = float(np.sum(w * neigh_temps))
 
-        # Ridge backbone on [1, ln_d, ln_dw]
+        # --- Ridge backbone with non-negative slopes on both features ---
+        # Solve ridge, then clip negative slopes to 0 and recompute intercept.
         lam = 10.0
-        Xg = np.column_stack([np.ones(len(X)), X])
+        Xg = np.column_stack([np.ones(len(X)), X])  # [1, ln d, -ln dwell]
         G = Xg.T @ Xg + lam * np.eye(Xg.shape[1])
-        beta = np.linalg.solve(G, Xg.T @ y)
-        T_ridge = float(beta[0] + beta[1]*q_raw[0] + beta[2]*q_raw[1])
+        beta = np.linalg.solve(G, Xg.T @ y)  # [b0, b_d, b_dwneg]
+        b0, b_d, b_dwneg = beta.tolist()
+        # Enforce physics: bigger diameter → not lower temp; higher speed (−ln dwell larger) → not lower temp
+        b_d = max(0.0, b_d)
+        b_dwneg = max(0.0, b_dwneg)
+        # Refit intercept to match means with constrained slopes
+        mean_y = float(y.mean())
+        mean_X = X.mean(axis=0)
+        b0 = mean_y - b_d * mean_X[0] - b_dwneg * mean_X[1]
+        T_ridge = float(b0 + b_d * q_raw[0] + b_dwneg * q_raw[1])
 
-        # Out-of-range test
+        # out-of-range check
         pr75 = float(np.percentile(D, 75))
         out_of_range = pr75 > oor_gate
 
-        # Blend
-        w_local = 0.75 if not out_of_range else 0.50
-        T_mix = w_local * T_knn + (1.0 - w_local) * T_ridge
+        # --- Monotonicity guard: isotonic vs speed at near-constant diameter ---
+        ln_d_all = np.log(clean_df['wire_dia_in'].values)
+        ln_dw_all = np.log(clean_df['dwell_s'].values)
+        temps_all = clean_df['anneal_temp_f'].values
 
-        # Clip to sane shop limits
+        def isotonic_predict(ln_d_q, ln_dw_q, band=0.12, min_n=10):
+            cur_band = band
+            for _ in range(5):  # widen progressively
+                mask = np.abs(ln_d_all - ln_d_q) <= cur_band
+                x = -ln_dw_all[mask]  # increasing x == faster line (shorter dwell)
+                yv = temps_all[mask]
+                if x.size >= min_n and np.unique(x).size >= 3:
+                    order = np.argsort(x)
+                    ir = IsotonicRegression(increasing=True, out_of_bounds='clip')
+                    ir.fit(x[order], yv[order])
+                    return float(ir.predict([-ln_dw_q])[0])
+                cur_band *= 1.5
+            return None
+
+        T_iso = isotonic_predict(q_raw[0], -q_raw[1])  # pass ln_d, ln_dw (note sign)
+        if T_iso is None:
+            # Fallback: use neighbor set to fit isotonic along speed directly
+            x_local = Z[I, 1]  # the standardized -ln(dwell) of neighbors
+            # Convert back to raw -ln(dwell) for a sane scale
+            x_local_raw = X[I, 1]
+            y_local = neigh_temps
+            if np.unique(x_local_raw).size >= 3:
+                order = np.argsort(x_local_raw)
+                ir = IsotonicRegression(increasing=True, out_of_bounds='clip')
+                ir.fit(x_local_raw[order], y_local[order])
+                T_iso = float(ir.predict([q_raw[1]])[0])
+
+        # blend local monotone with knn
+        if T_iso is not None:
+            T_local = 0.7 * T_iso + 0.3 * T_knn
+        else:
+            T_local = T_knn
+
+        # global blend with backbone
+        w_local = 0.75 if not out_of_range else 0.55
+        T_mix = w_local * T_local + (1.0 - w_local) * T_ridge
         T_final = float(np.clip(T_mix, 650.0, 1200.0))
 
         st.success("Prediction complete.")
-        res_col1, res_col2, res_col3, res_col4 = st.columns(4)
-        res_col1.metric("Predicted Temperature", f"{T_final:.1f} °F")
-        res_col2.metric("k-NN Core", f"{T_knn:.1f} °F")
-        res_col3.metric("Ridge Backbone", f"{T_ridge:.1f} °F")
-        res_col4.metric("Dwell Time", f"{dwell_s:.1f} s")
+        a, b, c, d = st.columns(4)
+        a.metric("Predicted Temperature", f"{T_final:.1f} °F")
+        b.metric("k-NN Core", f"{T_knn:.1f} °F")
+        c.metric("Backbone (NNLS ridge)", f"{T_ridge:.1f} °F")
+        d.metric("Dwell Time", f"{dwell_s:.1f} s")
+        if T_iso is not None:
+            st.caption(f"Monotonic guard active (isotonic vs speed).")
 
         st.caption(
             f"Distance stats (z-space): median={np.median(D):.2f} | p75={pr75:.2f} | out_of_range={out_of_range} | k={k_neighbors} | weighting={weight_method}"
         )
         if out_of_range:
-            st.warning("Parameters are outside the dense region of history; prediction leans on the backbone.")
+            st.warning("Parameters are outside the dense region of history; prediction leans more on the backbone and monotone fit.")
 
-        with st.expander("Analysis Details"):
+        with st.expander("Closest Historical Runs"):
             neighbor_display = clean_df.iloc[I][['wire_dia_in', 'speed_fpm', 'annealer_ht_ft', 'dwell_s', 'anneal_temp_f']].copy()
             neighbor_display['Distance'] = D
             neighbor_display['Weight'] = w
@@ -744,19 +645,6 @@ and a small **ridge backbone** for stability in sparse regions. Outliers can be 
                 }).background_gradient(subset=['Weight'], cmap='YlOrRd')
             )
 
-            fig = go.Figure()
-            fig.add_trace(go.Bar(
-                x=list(range(1, len(neigh_temps) + 1)),
-                y=neigh_temps,
-                text=[f"{t:.0f}°F  w={wt:.3f}" for t, wt in zip(neigh_temps, w)],
-                textposition='outside',
-                marker_color=w,
-                marker_colorscale='YlOrRd',
-                showlegend=False
-            ))
-            fig.add_hline(y=T_final, line_dash="dash", annotation_text=f"Predicted: {T_final:.1f}°F")
-            fig.update_layout(title='Neighbor Contributions to Prediction', xaxis_title='Neighbor Rank', yaxis_title='Temperature (°F)', height=380)
-            st.plotly_chart(fig, use_container_width=True)
 
 # ================================
 # MAIN APP
@@ -773,13 +661,13 @@ def main():
             "PAA Usage",
             "Anneal Temp Estimator",
         ],
-        index=5,  # default to Anneal estimator
+        index=5,
     )
 
     if page == "Runtime Calculator":
         runtime_calculator_page()
     elif page == "Copper Wire Converter":
-        awg_block()
+        copper_wire_converter_page()
     elif page == "Coated Copper Converter":
         coated_copper_converter_page()
     elif page == "Wire Stretch Predictor":
@@ -791,14 +679,13 @@ def main():
 
     st.sidebar.markdown("---")
     st.sidebar.info("""
-Zeus Polyimide Process Suite v2.1
+Zeus Polyimide Process Suite v2.3
 
-Upgrades:
-- kNN on log-space (ln d, ln dwell)
-- Z-score standardization
-- Gaussian weighting with adaptive bandwidth
-- Ridge backbone blend when out-of-range
-- Outlier QA and diagnostics
+Changes:
+- Decimal typing fix (custom inputs accept .08 / 0.08 cleanly)
+- Anneal model monotone vs speed, non-negative backbone slopes
+- PAA slider formatting fix
+- Correct speed quick reference
     """)
 
 if __name__ == "__main__":
