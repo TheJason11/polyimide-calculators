@@ -2,6 +2,7 @@ import math
 import re
 import base64
 import json
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -80,9 +81,11 @@ def decimal_input(label, default, key, min_value=None, max_value=None, help=None
 # ================================
 def awg_to_diameter_inches(awg):
     if isinstance(awg, str):
-        special = {"2/0": 0.3648, "3/0": 0.4096, "4/0": 0.4600}
+        special = {"4/0": 0.4600, "3/0": 0.4096, "2/0": 0.3648, "1/0": 0.3249}
         if awg in special:
             return special[awg]
+        if awg.strip() == "0":
+            return 0.3249
         awg = int(awg)
     if awg == 36:
         return 0.0050
@@ -151,6 +154,18 @@ def _gh_upsert_csv(path: str, df: pd.DataFrame, message: str) -> bool:
     r = requests.put(_gh_api_url(path), headers={"Authorization": f"token {GH_TOKEN}"}, data=json.dumps(payload))
     return r.status_code in (200, 201)
 
+def save_with_retry(path: str, df: pd.DataFrame, message: str, max_retries: int = 3) -> bool:
+    ok = False
+    for attempt in range(max_retries):
+        try:
+            ok = _gh_upsert_csv(path, df, message)
+            if ok:
+                return True
+        except requests.exceptions.RequestException:
+            pass
+        time.sleep(2 ** attempt)
+    return ok
+
 def load_csv(path: str, local_fallback: Path, required_cols: list[str]) -> pd.DataFrame | None:
     try:
         if GH_OWNER and GH_REPO:
@@ -169,14 +184,25 @@ def save_row(path: str, local_fallback: Path, cols: list[str], row: dict, commit
     row_df = pd.DataFrame([{k: row.get(k, "") for k in cols}])
     hist = load_csv(path, local_fallback, cols)
     combined = row_df if hist is None else pd.concat([hist, row_df], ignore_index=True)
+
+    # Try remote save with retry, but do not rely on it
+    remote_ok = False
     if GH_TOKEN:
-        if _gh_upsert_csv(path, combined, commit_message):
-            return True
+        remote_ok = save_with_retry(path, combined, commit_message, max_retries=3)
+
+    # Always write local fallback
+    local_ok = False
     try:
         combined.to_csv(local_fallback, index=False)
-        return True
-    except Exception:
-        return False
+        local_ok = True
+    except Exception as e:
+        st.error(f"Local save failed: {e}")
+
+    # Report status
+    if not remote_ok and GH_TOKEN:
+        st.warning("Remote save to GitHub did not confirm. Local file was written.")
+
+    return local_ok or remote_ok
 
 # =========================================================
 # WIRE DIAMETER PREDICTOR
@@ -235,6 +261,11 @@ def wire_diameter_predictor_page():
         do_predict = col_pred.button("Predict Final Diameter", use_container_width=True)
         do_save = col_save.button("Save Run", type="secondary", use_container_width=True)
 
+        st.markdown("**Reverse Calculator**")
+        target_final = decimal_input("Desired Final Diameter (in)", 0.04100, "wd_target", min_value=0.001, max_value=0.200,
+                                     help="Compute required starting diameter to hit this final under the inputs above.")
+        do_reverse = st.button("Compute Required Start Diameter", use_container_width=True, key="wd_reverse")
+
     with right:
         st.markdown("**Quick Calibrate Alpha (from a real run)**")
         cal_d0 = decimal_input("Known Start OD (in)", 0.04210, "cal_d0", min_value=0.001, max_value=0.200)
@@ -291,6 +322,21 @@ def wire_diameter_predictor_page():
                 c.metric("Predicted Stretch", f"{(d0 - raw_pred):.5f} in")
             except Exception as e:
                 st.error(f"Prediction failed: {e}")
+
+    # Reverse calculator output
+    if do_reverse:
+        if None in (target_final, speed, annealer_ht, anneal_temp, alpha):
+            st.error("Please complete inputs above and desired final diameter.")
+        else:
+            try:
+                base = _base_unscaled_stretch_in(d0 if d0 else target_final, passes, speed, annealer_ht, anneal_temp)
+                required_start = target_final + alpha * base
+                st.subheader("Reverse Calculator")
+                r1, r2 = st.columns(2)
+                r1.metric("Required Start Diameter", f"{required_start:.5f} in")
+                r2.metric("Delta Start minus Final", f"{(required_start - target_final):.5f} in")
+            except Exception as e:
+                st.error(f"Reverse calculation failed: {e}")
 
     if do_save:
         if None in (d0, speed, annealer_ht, anneal_temp, alpha):
@@ -705,6 +751,19 @@ def anneal_temp_estimator_page():
             f"Distance stats z space median {np.median(D):.2f}  p75 {pr75:.2f}  out of range {out_of_range}  k {k_neighbors}  weighting {weight_method}"
         )
 
+        # Uncertainty band from neighbors
+        try:
+            weighted_mean = T_knn
+            weighted_var = float(np.sum(w * (neigh_temps - weighted_mean) ** 2))
+            weighted_sd = float(np.sqrt(max(weighted_var, 0.0)))
+            q25, q75 = np.percentile(neigh_temps, [25, 75])
+            u1, u2, u3 = st.columns(3)
+            u1.metric("Weighted SD", f"±{weighted_sd:.1f} °F")
+            u2.metric("Neighbor IQR", f"{q25:.0f} to {q75:.0f} °F")
+            u3.metric("Neighbor Count", f"{len(neigh_temps)}")
+        except Exception:
+            st.caption("Uncertainty metrics unavailable for this query.")
+
         with st.expander("Closest Historical Runs"):
             neighbor_display = clean_df.iloc[I][['wire_dia_in', 'speed_fpm', 'annealer_ht_ft', 'dwell_s', 'anneal_temp_f']].copy()
             neighbor_display['Distance'] = D
@@ -755,7 +814,10 @@ def main():
     st.sidebar.info("""
 Zeus Polyimide Process Suite
 
-This build keeps the Wire Diameter Predictor, Runtime Calculator, and Anneal Temp Estimator as provided. Copper Wire and Coated Copper converters use a simple two way length and weight style. PAA Usage calculator now shows core fields by default with additional losses and allowance behind a toggle.
+This build adds three improvements.
+Reverse calculator on Wire Diameter to compute required start OD from a desired final.
+Anneal Temp Estimator shows a local uncertainty band from neighbor spread.
+GitHub saves now retry and always write a local fallback to protect history.
     """)
 
 if __name__ == "__main__":
