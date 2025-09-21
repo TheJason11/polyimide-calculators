@@ -114,13 +114,7 @@ def thermal_strain(delta_f, material="copper"):
     return 0.0
 
 # ================================
-# GitHub CSV helpers (shared)
-# Set secrets in Streamlit Cloud:
-# [gh]
-# token="YOUR_PAT"
-# owner="YourUser"
-# repo="YourRepo"
-# branch="main"
+# GitHub CSV helpers
 # ================================
 GH = st.secrets.get("gh", {})
 GH_TOKEN = GH.get("token", "")
@@ -202,7 +196,6 @@ WIRE_COLS = [
     "notes",
 ]
 
-# Session defaults for predictor
 if "alpha" not in st.session_state:
     st.session_state["alpha"] = 1.0
 if "use_isotonic" not in st.session_state:
@@ -370,7 +363,6 @@ def runtime_calculator_page():
 
 # ================================
 # COPPER WIRE CONVERTER PAGE
-# (reworked in the simpler two way style)
 # ================================
 def copper_wire_converter_page():
     st.title("Copper Wire Length and Weight")
@@ -415,7 +407,6 @@ def copper_wire_converter_page():
 
 # ================================
 # COATED COPPER CONVERTER PAGE
-# (reworked simpler converter with wall and density)
 # ================================
 def coated_copper_converter_page():
     st.title("Coated Copper Length and Weight")
@@ -467,35 +458,46 @@ def coated_copper_converter_page():
 def paa_usage_page():
     st.title("PAA Usage Calculator")
 
-    c1, c2, c3 = st.columns(3)
+    # Always visible core inputs
+    c1, c2, c3, c4, c5 = st.columns(5)
     with c1:
         id_in = decimal_input("ID (in)", 0.0160, "paa_id", min_value=0.0001, max_value=1.0)
     with c2:
         wall_in = decimal_input("Wall (in)", 0.0010, "paa_wall", min_value=0.0001, max_value=0.0500)
     with c3:
         length_ft = decimal_input("Finished Length (ft)", 1500.0, "paa_len", min_value=0.0)
-
-    c4, c5, c6 = st.columns(3)
     with c4:
         solids_frac = decimal_input("Solids Fraction", 0.15, "paa_solids", min_value=0.01, max_value=1.0)
     with c5:
-        startup_ft = decimal_input("Startup Scrap (ft)", 150.0, "paa_startup", min_value=0.0)
-    with c6:
-        shutdown_ft = decimal_input("Shutdown Scrap (ft)", 50.0, "paa_shutdown", min_value=0.0)
-
-    c7, c8, c9 = st.columns(3)
-    with c7:
-        hold_up_cm3 = decimal_input("Hold up Volume (cm³)", 400.0, "paa_holdup", min_value=0.0)
-    with c8:
-        heel_cm3 = decimal_input("Heel Volume (cm³)", 120.0, "paa_heel", min_value=0.0)
-    with c9:
         soln_density_g_cm3 = decimal_input("Solution Density (g cm³)", 1.06, "paa_soln_rho", min_value=0.80, max_value=1.50)
 
-    allowance_frac = decimal_input("Allowance Fraction", 0.05, "paa_allow", min_value=0.0, max_value=0.50)
+    # Toggle to reveal additional losses and allowance
+    with st.expander("Additional losses and allowance"):
+        c6, c7, c8 = st.columns(3)
+        with c6:
+            startup_ft = decimal_input("Startup Scrap (ft)", 150.0, "paa_startup", min_value=0.0)
+        with c7:
+            shutdown_ft = decimal_input("Shutdown Scrap (ft)", 50.0, "paa_shutdown", min_value=0.0)
+        with c8:
+            allowance_frac = decimal_input("Allowance Fraction", 0.05, "paa_allow", min_value=0.0, max_value=0.50)
 
+        c9, c10 = st.columns(2)
+        with c9:
+            hold_up_cm3 = decimal_input("Hold up Volume (cm³)", 400.0, "paa_holdup", min_value=0.0)
+        with c10:
+            heel_cm3 = decimal_input("Heel Volume (cm³)", 120.0, "paa_heel", min_value=0.0)
+
+    # Calculate button
     if st.button("Calculate PAA Usage", key="paa_calc"):
-        if None in (id_in, wall_in, length_ft, solids_frac, startup_ft, shutdown_ft, hold_up_cm3, heel_cm3, soln_density_g_cm3, allowance_frac):
-            st.error("Please complete all inputs.")
+        # Defaults for hidden fields in case expander was not opened
+        startup_ft = float(st.session_state.get("paa_startup_text", 150.0)) if 'paa_startup_text' in st.session_state else 150.0
+        shutdown_ft = float(st.session_state.get("paa_shutdown_text", 50.0)) if 'paa_shutdown_text' in st.session_state else 50.0
+        allowance_frac = float(st.session_state.get("paa_allow_text", 0.05)) if 'paa_allow_text' in st.session_state else 0.05
+        hold_up_cm3 = float(st.session_state.get("paa_holdup_text", 400.0)) if 'paa_holdup_text' in st.session_state else 400.0
+        heel_cm3 = float(st.session_state.get("paa_heel_text", 120.0)) if 'paa_heel_text' in st.session_state else 120.0
+
+        if None in (id_in, wall_in, length_ft, solids_frac, soln_density_g_cm3):
+            st.error("Please complete all required inputs.")
             return
 
         length_in = length_ft * IN_PER_FT
@@ -753,7 +755,7 @@ def main():
     st.sidebar.info("""
 Zeus Polyimide Process Suite
 
-This build keeps the Wire Diameter Predictor, Runtime Calculator, and Anneal Temp Estimator as provided. Copper Wire and Coated Copper converters use a simple two way length and weight style. PAA Usage calculator has been added.
+This build keeps the Wire Diameter Predictor, Runtime Calculator, and Anneal Temp Estimator as provided. Copper Wire and Coated Copper converters use a simple two way length and weight style. PAA Usage calculator now shows core fields by default with additional losses and allowance behind a toggle.
     """)
 
 if __name__ == "__main__":
