@@ -114,7 +114,13 @@ def thermal_strain(delta_f, material="copper"):
     return 0.0
 
 # ================================
-# GitHub CSV helpers
+# GitHub CSV helpers (shared)
+# Set secrets in Streamlit Cloud:
+# [gh]
+# token="YOUR_PAT"
+# owner="YourUser"
+# repo="YourRepo"
+# branch="main"
 # ================================
 GH = st.secrets.get("gh", {})
 GH_TOKEN = GH.get("token", "")
@@ -196,6 +202,7 @@ WIRE_COLS = [
     "notes",
 ]
 
+# Session defaults for predictor
 if "alpha" not in st.session_state:
     st.session_state["alpha"] = 1.0
 if "use_isotonic" not in st.session_state:
@@ -228,14 +235,8 @@ def wire_diameter_predictor_page():
         anneal_temp = decimal_input("Anneal Temperature (°F)", 800.0, "wd_temp", min_value=400.0, max_value=1200.0)
 
         st.markdown("**Model**")
-        alpha = decimal_input(
-            "Alpha stretch factor",
-            st.session_state["alpha"],
-            "wd_alpha",
-            min_value=1e-6,
-            max_value=10.0,  # widened so 1.000 does not warn
-            help="Scale on total stretch. Use Quick Calibrate to set it from a known run."
-        )
+        alpha = decimal_input("Alpha stretch factor", st.session_state["alpha"], "wd_alpha", min_value=1e-6, max_value=1e-1,
+                              help="Scale on total stretch. Use Quick Calibrate to set it from a known run.")
 
         col_pred, col_save = st.columns(2)
         do_predict = col_pred.button("Predict Final Diameter", use_container_width=True)
@@ -252,29 +253,22 @@ def wire_diameter_predictor_page():
         do_solve = st.button("Solve Alpha From This Run", use_container_width=True)
 
         st.markdown("**Recent history**")
-        try:
-            hist_df = load_csv(WIRE_FILE, WIRE_LOCAL, WIRE_COLS)
-            if isinstance(hist_df, pd.DataFrame) and not hist_df.empty:
-                show_cols = [
-                    "date_time",
-                    "starting_diameter_in",
-                    "passes",
-                    "line_speed_fpm",
-                    "annealer_height_ft",
-                    "annealer_temp_F",
-                    "pred_final_od_in",
-                    "actual_final_od_in",
-                    "alpha_used",
-                ]
-                avail = [c for c in show_cols if c in hist_df.columns]
-                if avail:
-                    st.dataframe(hist_df.tail(15)[avail], use_container_width=True, height=360)
-                else:
-                    st.info("History file found but its columns do not match the expected schema.")
-            else:
-                st.info("No history yet (wire_diameter_runs.csv)")
-        except Exception as e:
-            st.warning(f"Could not display history: {e}")
+        hist_df = load_csv(WIRE_FILE, WIRE_LOCAL, WIRE_COLS)
+        if hist_df is not None and len(hist_df) > 0:
+            show_cols = [
+                "date_time",
+                "starting_diameter_in",
+                "passes",
+                "line_speed_fpm",
+                "annealer_height_ft",
+                "annealer_temp_F",
+                "pred_final_od_in",
+                "actual_final_od_in",
+                "alpha_used",
+            ]
+            st.dataframe(hist_df.tail(15)[show_cols], use_container_width=True, height=360)
+        else:
+            st.info("No history yet (wire_diameter_runs.csv)")
 
     if do_solve:
         if None in (cal_d0, cal_df, cal_speed, cal_ht, cal_temp):
@@ -332,7 +326,7 @@ def wire_diameter_predictor_page():
                 st.error(f"Save failed: {e}")
 
 # ================================
-# RUNTIME CALCULATOR
+# RUNTIME CALCULATOR PAGE
 # ================================
 def runtime_calculator_page():
     st.title("Production Runtime Calculator")
@@ -371,95 +365,169 @@ def runtime_calculator_page():
         a,b,c = st.columns(3)
         a.metric("Effective Speed", f"{eff_speed:.1f} FPM")
         b.metric("Hourly Output", f"{hr_out:,.0f} ft hr")
-        c.metric("Daily Output", f"{day_out::,.0f} ft day")
+        c.metric("Daily Output", f"{day_out:,.0f} ft day")
     st.markdown("Typical line speeds  \nFine <0.010 in 15 to 25 FPM  0.010 to 0.050 in 12 to 20 FPM  Larger than 0.050 in 8 to 15 FPM.")
 
 # ================================
-# COPPER WIRE CONVERTER
+# COPPER WIRE CONVERTER PAGE
+# (reworked in the simpler two way style)
 # ================================
 def copper_wire_converter_page():
-    st.title("Copper Wire Weight Calculator")
-    method = st.radio("Input Method", ["Diameter", "AWG"], horizontal=True)
-    c1, c2, c3 = st.columns(3)
+    st.title("Copper Wire Length and Weight")
+    mode = st.radio("Choose converter", ["Feet to Pounds", "Pounds to Feet"], horizontal=True, index=0)
+
+    c1, c2 = st.columns(2)
     with c1:
-        if method == "AWG":
-            awg = st.selectbox("AWG Size", options=list(range(50, -1, -1)) + ["2/0","3/0","4/0"], index=20)
-            diameter_in = awg_to_diameter_inches(awg)
-            st.info(f"Diameter {diameter_in:.4f} in")
-        else:
-            diameter_in = decimal_input("Wire Diameter (in)", 0.0100, "cw_d", min_value=0.0001, max_value=1.0)
-            if diameter_in:
-                eq = diameter_inches_to_awg(diameter_in)
-                if eq is not None:
-                    st.info(f"Closest AWG {eq}")
+        d_in = decimal_input("Wire Diameter (in)", 0.0500, "cw_d", min_value=0.0001, max_value=1.0)
     with c2:
-        length_ft = decimal_input("Wire Length (ft)", 1000.0, "cw_len", min_value=0.0)
-    with c3:
-        rho = decimal_input("Copper Density (lb in³)", COPPER_DENSITY_LB_PER_IN3, "cw_rho", min_value=0.300, max_value=0.350)
-    if st.button("Calculate", key="cw_calc"):
-        if None in (diameter_in, length_ft, rho):
-            st.error("Please complete all inputs.")
-            return
-        area = circle_area(diameter_in)
-        vol = wire_volume_in3(diameter_in, length_ft)
-        wt = vol * rho
-        wpf = wt / length_ft if length_ft > 0 else 0
-        a,b,c = st.columns(3)
-        a.metric("Wire Weight", f"{wt:.3f} lbs")
-        b.metric("Weight per Foot", f"{wpf:.5f} lb ft")
-        c.metric("Cross Section", f"{area:.6f} in²")
+        if d_in:
+            area_in2 = circle_area(d_in)
+            st.info(f"Cross Section Area {area_in2:.6f} in²")
+        else:
+            area_in2 = None
+
+    if mode == "Feet to Pounds":
+        feet = decimal_input("Length (ft)", 12000.0, "cw_len_ft", min_value=0.0)
+        if st.button("Calculate", key="cw_calc_ft_to_lb"):
+            if None in (d_in, feet):
+                st.error("Please complete all inputs.")
+                return
+            length_in = feet * IN_PER_FT
+            volume_in3 = area_in2 * length_in
+            pounds = volume_in3 * COPPER_DENSITY_LB_PER_IN3
+            st.subheader("Results")
+            st.metric("Estimated Weight", f"{pounds:,.2f} lb")
+            st.caption(f"Linear Density {(pounds/feet) if feet>0 else 0:.5f} lb per ft")
+    else:
+        pounds = decimal_input("Weight (lb)", 54.0, "cw_lb", min_value=0.0)
+        if st.button("Calculate", key="cw_calc_lb_to_ft"):
+            if None in (d_in, pounds):
+                st.error("Please complete all inputs.")
+                return
+            if area_in2 is None or area_in2 <= 0:
+                st.error("Diameter must be greater than zero.")
+                return
+            length_in = pounds / (COPPER_DENSITY_LB_PER_IN3 * area_in2)
+            feet = length_in / IN_PER_FT
+            st.subheader("Results")
+            st.metric("Estimated Length", f"{feet:,.0f} ft")
+            st.caption(f"Linear Density {(pounds/feet) if feet>0 else 0:.5f} lb per ft")
 
 # ================================
-# COATED COPPER CONVERTER
+# COATED COPPER CONVERTER PAGE
+# (reworked simpler converter with wall and density)
 # ================================
 def coated_copper_converter_page():
-    st.title("Coated Wire Weight Calculator")
-    with st.form("coat_form"):
-        c1,c2,c3,c4 = st.columns(4)
-        with c1:
-            d_cu = decimal_input("Copper Diameter (in)", 0.0100, "coat_d", min_value=0.001, max_value=0.200)
-        with c2:
-            t_mil = decimal_input("Coating per Side (mil)", 1.0, "coat_t", min_value=0.1, max_value=10.0)
-        with c3:
-            L = decimal_input("Wire Length (ft)", 1000.0, "coat_len", min_value=0.0)
-        with c4:
-            layers = int(st.number_input("Number of Layers", min_value=1, max_value=20, value=1, step=1))
-        with st.expander("Advanced"):
-            a,b,c = st.columns(3)
-            with a:
-                rho_pi = decimal_input("Polyimide Density (g cm³)", PI_DENSITY_G_PER_CM3_DEFAULT, "coat_rho", min_value=1.0, max_value=2.0)
-            with b:
-                eff = decimal_input("Layer Efficiency (%)", 95.0, "coat_eff", min_value=80.0, max_value=100.0)
-            with c:
-                scrap = decimal_input("Scrap Rate (%)", 5.0, "coat_scrap", min_value=0.0, max_value=20.0)
-        go = st.form_submit_button("Calculate Coated Wire Properties")
-    if go:
-        if None in (d_cu, t_mil, L, rho_pi, eff, scrap):
-            st.error("Please complete all inputs.")
-            return
-        build_in = (t_mil * layers * eff / 100.0) / MIL_PER_IN
-        d_final = d_cu + 2*build_in
-        v_cu = wire_volume_in3(d_cu, L)
-        v_total = wire_volume_in3(d_final, L)
-        v_pi = v_total - v_cu
-        wt_cu = v_cu * COPPER_DENSITY_LB_PER_IN3
-        wt_pi_g = (v_pi * IN3_TO_CM3) * rho_pi
-        wt_pi = wt_pi_g * LB_PER_G
-        wt_total = wt_cu + wt_pi
-        wt_scrap = wt_total * (1 + scrap/100.0)
-        a,b,c,d = st.columns(4)
-        a.metric("Starting OD", f"{d_cu:.4f} in")
-        b.metric("Coating Build", f"{build_in*MIL_PER_IN:.1f} mil side")
-        c.metric("Final OD", f"{d_final:.4f} in")
-        d.metric("OD Increase", f"{(d_final/d_cu - 1)*100:.1f}%")
-        a,b,c,d = st.columns(4)
-        a.metric("Copper Weight", f"{wt_cu:.3f} lbs")
-        b.metric("Coating Weight", f"{wt_pi:.3f} lbs")
-        c.metric("Total Weight", f"{wt_total:.3f} lbs")
-        d.metric("With Scrap", f"{wt_scrap:.3f} lbs")
+    st.title("Coated Copper Length and Weight")
+    mode = st.radio("Choose converter", ["Feet to Pounds", "Pounds to Feet"], horizontal=True, index=0)
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        id_in = decimal_input("Bare Copper Diameter ID (in)", 0.0500, "cc_id", min_value=0.0001, max_value=1.0)
+    with c2:
+        wall_in = decimal_input("Coating Wall (in)", 0.0015, "cc_wall", min_value=0.0, max_value=0.1000)
+    with c3:
+        coat_density = decimal_input("Coating Density (lb in³)", 0.0513, "cc_rho", min_value=0.0100, max_value=0.0800)
+
+    if None in (id_in, wall_in, coat_density):
+        st.info("Enter all inputs to calculate.")
+        return
+
+    area_cu_in2 = circle_area(id_in)
+    area_coat_in2 = annulus_area(id_in, wall_in)
+    lin_den_lb_per_ft = IN_PER_FT * (area_cu_in2 * COPPER_DENSITY_LB_PER_IN3 + area_coat_in2 * coat_density)
+
+    if mode == "Feet to Pounds":
+        feet = decimal_input("Length (ft)", 1500.0, "cc_len_ft", min_value=0.0)
+        if st.button("Calculate", key="cc_ft_to_lb"):
+            if feet is None:
+                st.error("Please enter length.")
+                return
+            pounds = feet * lin_den_lb_per_ft
+            st.subheader("Results")
+            st.metric("Linear Density", f"{lin_den_lb_per_ft:,.5f} lb per ft")
+            st.metric("Estimated Weight", f"{pounds:,.3f} lb")
+    else:
+        gross_lb = decimal_input("Gross Spool Weight (lb)", 12.0, "cc_gross", min_value=0.0)
+        tare_lb = decimal_input("Spool Tare (lb)", 0.0, "cc_tare", min_value=0.0)
+        if st.button("Calculate", key="cc_lb_to_ft"):
+            if None in (gross_lb, tare_lb):
+                st.error("Please enter weights.")
+                return
+            net_lb = max(gross_lb - tare_lb, 0.0)
+            feet = (net_lb / lin_den_lb_per_ft) if lin_den_lb_per_ft > 0 else 0.0
+            st.subheader("Results")
+            st.metric("Linear Density", f"{lin_den_lb_per_ft:,.5f} lb per ft")
+            st.metric("Net Wire Weight", f"{net_lb:,.3f} lb")
+            st.metric("Estimated Length", f"{feet:,.0f} ft")
 
 # ================================
-# ANNEAL TEMP ESTIMATOR
+# PAA USAGE PAGE
+# ================================
+def paa_usage_page():
+    st.title("PAA Usage Calculator")
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        id_in = decimal_input("ID (in)", 0.0160, "paa_id", min_value=0.0001, max_value=1.0)
+    with c2:
+        wall_in = decimal_input("Wall (in)", 0.0010, "paa_wall", min_value=0.0001, max_value=0.0500)
+    with c3:
+        length_ft = decimal_input("Finished Length (ft)", 1500.0, "paa_len", min_value=0.0)
+
+    c4, c5, c6 = st.columns(3)
+    with c4:
+        solids_frac = decimal_input("Solids Fraction", 0.15, "paa_solids", min_value=0.01, max_value=1.0)
+    with c5:
+        startup_ft = decimal_input("Startup Scrap (ft)", 150.0, "paa_startup", min_value=0.0)
+    with c6:
+        shutdown_ft = decimal_input("Shutdown Scrap (ft)", 50.0, "paa_shutdown", min_value=0.0)
+
+    c7, c8, c9 = st.columns(3)
+    with c7:
+        hold_up_cm3 = decimal_input("Hold up Volume (cm³)", 400.0, "paa_holdup", min_value=0.0)
+    with c8:
+        heel_cm3 = decimal_input("Heel Volume (cm³)", 120.0, "paa_heel", min_value=0.0)
+    with c9:
+        soln_density_g_cm3 = decimal_input("Solution Density (g cm³)", 1.06, "paa_soln_rho", min_value=0.80, max_value=1.50)
+
+    allowance_frac = decimal_input("Allowance Fraction", 0.05, "paa_allow", min_value=0.0, max_value=0.50)
+
+    if st.button("Calculate PAA Usage", key="paa_calc"):
+        if None in (id_in, wall_in, length_ft, solids_frac, startup_ft, shutdown_ft, hold_up_cm3, heel_cm3, soln_density_g_cm3, allowance_frac):
+            st.error("Please complete all inputs.")
+            return
+
+        length_in = length_ft * IN_PER_FT
+        A_wall_in2 = annulus_area(id_in, wall_in)
+        V_in3 = A_wall_in2 * length_in
+        V_cm3 = V_in3 * IN3_TO_CM3
+
+        mass_PI_g = V_cm3 * PI_DENSITY_G_PER_CM3_DEFAULT
+        mass_PI_lb = mass_PI_g * LB_PER_G
+        solution_for_polymer_lb = mass_PI_lb / solids_frac if solids_frac > 0 else 0.0
+
+        scrap_total_ft = startup_ft + shutdown_ft
+        scrap_solution_lb = solution_for_polymer_lb * (scrap_total_ft / length_ft) if length_ft > 0 else 0.0
+
+        hold_up_mass_lb = (hold_up_cm3 * soln_density_g_cm3) * LB_PER_G
+        heel_mass_lb = (heel_cm3 * soln_density_g_cm3) * LB_PER_G
+
+        subtotal_lb = solution_for_polymer_lb + scrap_solution_lb + hold_up_mass_lb + heel_mass_lb
+        total_with_allowance_lb = subtotal_lb * (1.0 + allowance_frac)
+
+        st.subheader("Results")
+        a, b, c = st.columns(3)
+        a.metric("Solution for Finished Length", f"{solution_for_polymer_lb:,.4f} lb")
+        b.metric("Startup plus Shutdown Scrap", f"{scrap_solution_lb:,.4f} lb")
+        c.metric("Subtotal", f"{subtotal_lb:,.4f} lb")
+        a, b, c = st.columns(3)
+        a.metric("Hold up Mass", f"{hold_up_mass_lb:,.3f} lb")
+        b.metric("Heel Mass", f"{heel_mass_lb:,.3f} lb")
+        c.metric("Total with Allowance", f"{total_with_allowance_lb:,.4f} lb")
+
+# ================================
+# ANNEAL TEMP ESTIMATOR PAGE
 # ================================
 def anneal_temp_estimator_page():
     st.title("Advanced Annealing Temperature Estimator")
@@ -662,6 +730,7 @@ def main():
             "Runtime Calculator",
             "Copper Wire Converter",
             "Coated Copper Converter",
+            "PAA Usage",
             "Anneal Temp Estimator",
         ],
         index=0,
@@ -675,6 +744,8 @@ def main():
         copper_wire_converter_page()
     elif page == "Coated Copper Converter":
         coated_copper_converter_page()
+    elif page == "PAA Usage":
+        paa_usage_page()
     elif page == "Anneal Temp Estimator":
         anneal_temp_estimator_page()
 
@@ -682,7 +753,7 @@ def main():
     st.sidebar.info("""
 Zeus Polyimide Process Suite
 
-This build updates the Wire Diameter Predictor to a 5 input model with Quick Calibrate Alpha and CSV logging to GitHub. All other tools remain unchanged.
+This build keeps the Wire Diameter Predictor, Runtime Calculator, and Anneal Temp Estimator as provided. Copper Wire and Coated Copper converters use a simple two way length and weight style. PAA Usage calculator has been added.
     """)
 
 if __name__ == "__main__":
