@@ -24,25 +24,26 @@ st.set_page_config(
 # CONSTANTS
 # ================================
 COPPER_DENSITY_LB_PER_IN3 = 0.323
-E_COPPER_PSI = 16_000_000
-NU_COPPER = 0.34
 PI_DENSITY_G_PER_CM3_DEFAULT = 1.42
 
 IN3_TO_CM3 = 16.387064
 G_PER_LB = 453.59237
 LB_PER_G = 1.0 / G_PER_LB
-MIL_PER_IN = 1000.0
-IN_PER_MIL = 1.0 / MIL_PER_IN
 IN_PER_FT = 12.0
 PI = math.pi
 
-YIELD_STRESS_ANNEALED_MIN = 10_000
-YIELD_STRESS_ANNEALED_MAX = 20_000
-YIELD_STRESS_HARD_MIN = 30_000
-YIELD_STRESS_HARD_MAX = 45_000
-
 COPPER_ALPHA_PER_C = 16.5e-6
 PI_ALPHA_PER_C = 20e-6
+
+BASELINE_ACTIVATION_F = 650.0  # anneal activation floor
+
+# Tension model defaults (you can expose in an "advanced" expander if you want)
+SIGMA_REF_PSI = 1500.0   # stress where tension factor ~= 1
+TENSION_P = 1.0          # exponent for mechanical scaling
+THERM_Q = 0.5            # exponent for thermal scaling (creep-like)
+EPS_THERM_FLOOR = 0.05   # small thermal floor at zero tension
+SPOOL_MULT_LARGE = 1.0
+SPOOL_MULT_22 = 1.6      # 22" tends to deliver higher effective line tension
 
 # ================================
 # DECIMAL INPUT
@@ -185,12 +186,10 @@ def save_row(path: str, local_fallback: Path, cols: list[str], row: dict, commit
     hist = load_csv(path, local_fallback, cols)
     combined = row_df if hist is None else pd.concat([hist, row_df], ignore_index=True)
 
-    # Try remote save with retry, but do not rely on it
     remote_ok = False
     if GH_TOKEN:
         remote_ok = save_with_retry(path, combined, commit_message, max_retries=3)
 
-    # Always write local fallback
     local_ok = False
     try:
         combined.to_csv(local_fallback, index=False)
@@ -198,7 +197,6 @@ def save_row(path: str, local_fallback: Path, cols: list[str], row: dict, commit
     except Exception as e:
         st.error(f"Local save failed: {e}")
 
-    # Report status
     if not remote_ok and GH_TOKEN:
         st.warning("Remote save to GitHub did not confirm. Local file was written.")
 
@@ -216,29 +214,75 @@ WIRE_COLS = [
     "line_speed_fpm",
     "annealer_height_ft",
     "annealer_temp_F",
+    "payoff_type",
+    "payoff_tension_lb",
     "pred_final_od_in",
     "actual_final_od_in",
     "alpha_used",
     "notes",
 ]
 
+# Session defaults
 if "alpha" not in st.session_state:
-    st.session_state["alpha"] = 1.0
-if "use_isotonic" not in st.session_state:
-    st.session_state["use_isotonic"] = True
+    st.session_state["alpha"] = 0.10  # you will recalibrate
+if "use_residual_learning" not in st.session_state:
+    st.session_state["use_residual_learning"] = False
 
-BASELINE_ACTIVATION_F = 650.0
+def _effective_tension(tension_lb: float, payoff_type: str) -> float:
+    if payoff_type == '22" Spool':
+        return tension_lb * SPOOL_MULT_22
+    return tension_lb * SPOOL_MULT_LARGE
 
-def _base_unscaled_stretch_in(d0_in: float, passes: int, speed_fpm: float, ht_ft: float, temp_f: float) -> float:
-    mech = 0.000012 * passes * (1.0 + 0.08 * math.log(max(speed_fpm, 1.0)))
+def _tension_factors(d0_in: float, tension_lb: float, payoff_type: str):
+    """Return (phi_mech, phi_therm) given start diameter, indicated tension, and payoff type."""
+    area_in2 = max(circle_area(max(d0_in, 1e-6)), 1e-9)
+    T_eff = _effective_tension(max(tension_lb, 0.0), payoff_type)
+    sigma = T_eff / area_in2  # psi
+
+    # Mechanical scaling
+    phi_mech = (sigma / SIGMA_REF_PSI) ** TENSION_P if sigma > 0 else 0.0
+    # Thermal scaling with floor
+    phi_therm = EPS_THERM_FLOOR + (1.0 - EPS_THERM_FLOOR) * (phi_mech ** THERM_Q)
+    # Clamp to avoid blow-ups
+    phi_mech = float(np.clip(phi_mech, 0.0, 3.0))
+    phi_therm = float(np.clip(phi_therm, EPS_THERM_FLOOR, 3.0))
+    return phi_mech, phi_therm
+
+def _base_unscaled_stretch_in(d0_in: float, passes: int, speed_fpm: float, ht_ft: float, temp_f: float,
+                              tension_lb: float, payoff_type: str) -> float:
+    """Baseline stretch before alpha. Includes passes, dwell, temperature AND tension."""
+    # Original shape
+    mech0 = 0.000012 * passes * (1.0 + 0.08 * math.log(max(speed_fpm, 1.0)))
     act = max(0.0, temp_f - BASELINE_ACTIVATION_F)
-    therm = (0.00000035 * passes * ht_ft * act) / max(speed_fpm, 1.0)
+    therm0 = (0.00000035 * passes * ht_ft * act) / max(speed_fpm, 1.0)
+
+    # Tension scaling
+    phi_mech, phi_therm = _tension_factors(d0_in, tension_lb, payoff_type)
+
+    mech = mech0 * phi_mech
+    therm = therm0 * phi_therm
+
     return mech + therm
 
-def _predict_final_od(d0_in: float, passes: int, speed_fpm: float, ht_ft: float, temp_f: float, alpha: float) -> float:
-    raw_stretch = _base_unscaled_stretch_in(d0_in, passes, speed_fpm, ht_ft, temp_f)
+def _predict_final_od(d0_in: float, passes: int, speed_fpm: float, ht_ft: float, temp_f: float,
+                      tension_lb: float, payoff_type: str, alpha: float) -> float:
+    raw_stretch = _base_unscaled_stretch_in(d0_in, passes, speed_fpm, ht_ft, temp_f, tension_lb, payoff_type)
     dfinal = max(0.0, d0_in - alpha * raw_stretch)
     return dfinal
+
+def _reverse_required_start(target_final_in: float, passes: int, speed_fpm: float, ht_ft: float, temp_f: float,
+                            tension_lb: float, payoff_type: str, alpha: float,
+                            max_iter: int = 8, tol: float = 1e-6) -> float:
+    """Solve d0 such that predicted_final(d0)=target_final. Needs iteration because stress depends on d0."""
+    d0 = max(target_final_in + 0.001, 1e-5)
+    for _ in range(max_iter):
+        base = _base_unscaled_stretch_in(d0, passes, speed_fpm, ht_ft, temp_f, tension_lb, payoff_type)
+        new_d0 = target_final_in + alpha * base
+        if abs(new_d0 - d0) < tol:
+            d0 = new_d0
+            break
+        d0 = new_d0
+    return max(d0, target_final_in)  # monotone
 
 def wire_diameter_predictor_page():
     st.title("Wire Diameter Predictor")
@@ -246,20 +290,32 @@ def wire_diameter_predictor_page():
     left, right = st.columns([1.25, 1.0])
 
     with left:
-        st.markdown("**Inputs (5)**")
+        st.markdown("**Inputs**")
         d0 = decimal_input("Starting Diameter (in)", 0.04210, "wd_d0", min_value=0.001, max_value=0.200)
         passes = int(st.number_input("Number of Passes", min_value=1, max_value=200, value=30, step=1, key="wd_passes"))
         speed = decimal_input("Line Speed (FPM)", 18.0, "wd_speed", min_value=1.0, max_value=100.0)
         annealer_ht = decimal_input("Annealer Height (ft)", 14.0, "wd_ht", min_value=1.0, max_value=50.0)
-        anneal_temp = decimal_input("Anneal Temperature (°F)", 800.0, "wd_temp", min_value=400.0, max_value=1200.0)
+        anneal_temp = decimal_input("Anneal Temperature (°F)", 825.0, "wd_temp", min_value=400.0, max_value=1200.0)
+
+        payoff_type = st.selectbox("Payoff Type", ['Large', '22" Spool'], index=0, key="wd_payoff")
+        max_tension = 4.0 if payoff_type == 'Large' else 15.0
+        payoff_tension = decimal_input("Payoff Tension (lbf)", 2.0 if payoff_type=='Large' else 10.0,
+                                       "wd_tension", min_value=0.0, max_value=max_tension,
+                                       help="Large: 0–4 lbf. 22\" Spool: 0–15 lbf.")
 
         st.markdown("**Model**")
-        alpha = decimal_input("Alpha stretch factor", st.session_state["alpha"], "wd_alpha", min_value=1e-6, max_value=1e-1,
+        alpha = decimal_input("Alpha stretch factor", st.session_state["alpha"], "wd_alpha",
+                              min_value=1e-6, max_value=2.0,
                               help="Scale on total stretch. Use Quick Calibrate to set it from a known run.")
 
-        col_pred, col_save = st.columns(2)
-        do_predict = col_pred.button("Predict Final Diameter", use_container_width=True)
-        do_save = col_save.button("Save Run", type="secondary", use_container_width=True)
+        with st.expander("Tension model (advanced)"):
+            st.caption("These tune tension sensitivity. Defaults are usually fine.")
+            st.write(f"σ_ref={SIGMA_REF_PSI:.0f} psi, p={TENSION_P}, q={THERM_Q}, ε={EPS_THERM_FLOOR}, spool_mult(22\")={SPOOL_MULT_22}")
+
+        cols = st.columns(3)
+        do_predict = cols[0].button("Predict Final Diameter", use_container_width=True)
+        do_save = cols[1].button("Save Run", type="secondary", use_container_width=True)
+        do_toggle_resid = cols[2].toggle("Residual learning", key="use_residual_learning", help="Use history to correct bias when enough similar runs exist.")
 
         st.markdown("**Reverse Calculator**")
         target_final = decimal_input("Desired Final Diameter (in)", 0.04100, "wd_target", min_value=0.001, max_value=0.200,
@@ -272,8 +328,14 @@ def wire_diameter_predictor_page():
         cal_df = decimal_input("Known Final OD (in)", 0.04100, "cal_df", min_value=0.001, max_value=0.200)
         cal_speed = decimal_input("Speed FPM", 18.0, "cal_speed", min_value=1.0, max_value=100.0)
         cal_ht = decimal_input("Annealer Height ft", 14.0, "cal_ht", min_value=1.0, max_value=50.0)
-        cal_temp = decimal_input("Anneal Temp °F", 800.0, "cal_temp", min_value=400.0, max_value=1200.0)
+        cal_temp = decimal_input("Anneal Temp °F", 825.0, "cal_temp", min_value=400.0, max_value=1200.0)
         cal_passes = int(st.number_input("Passes", min_value=1, max_value=200, value=30, step=1, key="cal_passes"))
+        cal_payoff_type = st.selectbox("Payoff Type", ['Large', '22" Spool'], index=0, key="cal_payoff")
+        cal_max_tension = 4.0 if cal_payoff_type == 'Large' else 15.0
+        cal_tension = decimal_input("Payoff Tension (lbf)",
+                                    2.0 if cal_payoff_type=='Large' else 10.0,
+                                    "cal_tension", min_value=0.0, max_value=cal_max_tension)
+
         do_solve = st.button("Solve Alpha From This Run", use_container_width=True)
 
         st.markdown("**Recent history**")
@@ -286,6 +348,8 @@ def wire_diameter_predictor_page():
                 "line_speed_fpm",
                 "annealer_height_ft",
                 "annealer_temp_F",
+                "payoff_type",
+                "payoff_tension_lb",
                 "pred_final_od_in",
                 "actual_final_od_in",
                 "alpha_used",
@@ -294,11 +358,13 @@ def wire_diameter_predictor_page():
         else:
             st.info("No history yet (wire_diameter_runs.csv)")
 
+    # Quick calibrate
     if do_solve:
-        if None in (cal_d0, cal_df, cal_speed, cal_ht, cal_temp):
+        if None in (cal_d0, cal_df, cal_speed, cal_ht, cal_temp, cal_tension):
             st.error("Please complete all calibration inputs.")
         else:
-            base_stretch = _base_unscaled_stretch_in(cal_d0, cal_passes, cal_speed, cal_ht, cal_temp)
+            base_stretch = _base_unscaled_stretch_in(cal_d0, cal_passes, cal_speed, cal_ht, cal_temp,
+                                                     cal_tension, cal_payoff_type)
             if base_stretch <= 0:
                 st.error("Cannot solve alpha because base stretch is zero. Check inputs.")
             else:
@@ -307,30 +373,41 @@ def wire_diameter_predictor_page():
                 st.session_state["wd_alpha"] = str(solved_alpha)
                 st.success(f"Solved alpha = {solved_alpha:.6f}. The Alpha field has been updated.")
 
+    # Predict forward
     if do_predict:
-        if None in (d0, speed, annealer_ht, anneal_temp, alpha):
+        if None in (d0, speed, annealer_ht, anneal_temp, alpha, payoff_tension):
             st.error("Please complete all inputs.")
         else:
             try:
-                raw_pred = _predict_final_od(d0, passes, speed, annealer_ht, anneal_temp, alpha)
+                raw_pred = _predict_final_od(d0, passes, speed, annealer_ht, anneal_temp, payoff_tension, payoff_type, alpha)
+                # Optional residual correction from history
+                correction, n_neigh = 0.0, 0
+                if st.session_state.get("use_residual_learning", False):
+                    correction, n_neigh = residual_correction_from_history(
+                        d0, passes, speed, annealer_ht, anneal_temp, payoff_tension, payoff_type, alpha
+                    )
+                    raw_pred = float(np.clip(raw_pred + correction, 0.0, 1.0))
+
                 st.subheader("Prediction")
                 st.metric("Predicted Final Diameter", f"{raw_pred:.5f} in")
-                base = _base_unscaled_stretch_in(d0, passes, speed, annealer_ht, anneal_temp)
+                base = _base_unscaled_stretch_in(d0, passes, speed, annealer_ht, anneal_temp, payoff_tension, payoff_type)
                 a, b, c = st.columns(3)
                 a.metric("Base Unscaled Stretch", f"{base:.5f} in")
                 b.metric("Alpha Used", f"{alpha:.4f}")
                 c.metric("Predicted Stretch", f"{(d0 - raw_pred):.5f} in")
+                if st.session_state.get("use_residual_learning", False):
+                    st.caption(f"Residual correction {correction:+.5f} in applied from {n_neigh} similar runs.")
             except Exception as e:
                 st.error(f"Prediction failed: {e}")
 
-    # Reverse calculator output
+    # Reverse calculator
     if do_reverse:
-        if None in (target_final, speed, annealer_ht, anneal_temp, alpha):
+        if None in (target_final, speed, annealer_ht, anneal_temp, alpha, payoff_tension):
             st.error("Please complete inputs above and desired final diameter.")
         else:
             try:
-                base = _base_unscaled_stretch_in(d0 if d0 else target_final, passes, speed, annealer_ht, anneal_temp)
-                required_start = target_final + alpha * base
+                required_start = _reverse_required_start(target_final, passes, speed, annealer_ht, anneal_temp,
+                                                         payoff_tension, payoff_type, alpha)
                 st.subheader("Reverse Calculator")
                 r1, r2 = st.columns(2)
                 r1.metric("Required Start Diameter", f"{required_start:.5f} in")
@@ -338,12 +415,15 @@ def wire_diameter_predictor_page():
             except Exception as e:
                 st.error(f"Reverse calculation failed: {e}")
 
+    # Save
     if do_save:
-        if None in (d0, speed, annealer_ht, anneal_temp, alpha):
+        if None in (d0, speed, annealer_ht, anneal_temp, alpha, payoff_tension):
             st.error("Please complete all inputs before saving.")
         else:
             try:
-                pred_val = _predict_final_od(d0, passes, speed, annealer_ht, anneal_temp, alpha)
+                pred_val = _predict_final_od(d0, passes, speed, annealer_ht, anneal_temp, payoff_tension, payoff_type, alpha)
+                # Optional input to capture actual final now (or leave blank)
+                actual_optional = st.session_state.get("wd_actual_text", "")
                 row = {
                     "date_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     "starting_diameter_in": float(d0),
@@ -351,8 +431,10 @@ def wire_diameter_predictor_page():
                     "line_speed_fpm": float(speed),
                     "annealer_height_ft": float(annealer_ht),
                     "annealer_temp_F": float(anneal_temp),
+                    "payoff_type": payoff_type,
+                    "payoff_tension_lb": float(payoff_tension),
                     "pred_final_od_in": float(pred_val),
-                    "actual_final_od_in": "",
+                    "actual_final_od_in": actual_optional,
                     "alpha_used": float(alpha),
                     "notes": "",
                 }
@@ -364,52 +446,131 @@ def wire_diameter_predictor_page():
             except Exception as e:
                 st.error(f"Save failed: {e}")
 
-# ================================
-# RUNTIME CALCULATOR PAGE
-# ================================
+# ---------- Residual “learning” layer (optional) ----------
+def _features_for_residual(d0, passes, speed_fpm, ht_ft, temp_f, tension_lb, payoff_type):
+    """Return feature vector for kNN residuals."""
+    dwell_s = (ht_ft / max(speed_fpm, 1e-6)) * 60.0
+    T_eff = _effective_tension(tension_lb, payoff_type)
+    return np.array([
+        math.log(max(d0, 1e-6)),
+        float(passes),
+        math.log(max(dwell_s, 1e-6)),
+        float(temp_f),
+        math.log(max(T_eff, 1e-6)),
+        1.0 if payoff_type == '22" Spool' else 0.0
+    ], dtype=float)
+
+def residual_correction_from_history(d0, passes, speed_fpm, ht_ft, temp_f, tension_lb, payoff_type, alpha,
+                                     k: int = 15, gate_p75: float = 1.5):
+    """kNN residual (actual - base_pred) from previously saved runs."""
+    hist = load_csv(WIRE_FILE, WIRE_LOCAL, WIRE_COLS)
+    if hist is None or len(hist) < 12:
+        return 0.0, 0
+    # Filter rows with actuals and needed fields
+    need = ["starting_diameter_in", "passes", "line_speed_fpm", "annealer_height_ft", "annealer_temp_F",
+            "payoff_type", "payoff_tension_lb", "actual_final_od_in"]
+    for c in need:
+        if c not in hist.columns:
+            return 0.0, 0
+    hist = hist.dropna(subset=need)
+    if len(hist) < 12:
+        return 0.0, 0
+
+    # Build features and residuals
+    X_list, res_list = [], []
+    for _, r in hist.iterrows():
+        try:
+            d0_i = float(r["starting_diameter_in"])
+            p_i = int(r["passes"])
+            s_i = float(r["line_speed_fpm"])
+            h_i = float(r["annealer_height_ft"])
+            t_i = float(r["annealer_temp_F"])
+            pt_i = str(r["payoff_type"]) if pd.notna(r["payoff_type"]) else "Large"
+            T_i = float(r["payoff_tension_lb"])
+            actual_i = float(r["actual_final_od_in"])
+            pred_i = _predict_final_od(d0_i, p_i, s_i, h_i, t_i, T_i, pt_i, alpha)
+            X_list.append(_features_for_residual(d0_i, p_i, s_i, h_i, t_i, T_i, pt_i))
+            res_list.append(actual_i - pred_i)
+        except Exception:
+            continue
+
+    if len(X_list) < 12:
+        return 0.0, 0
+
+    X = np.vstack(X_list)
+    y_res = np.array(res_list, dtype=float)
+
+    # Standardize
+    mu = X.mean(axis=0)
+    sd = X.std(axis=0, ddof=1)
+    sd[sd == 0] = 1.0
+    Z = (X - mu) / sd
+
+    q = _features_for_residual(d0, passes, speed_fpm, ht_ft, temp_f, tension_lb, payoff_type)
+    qz = (q - mu) / sd
+
+    k_eff = min(k, len(Z))
+    nn = NearestNeighbors(n_neighbors=k_eff, metric='euclidean').fit(Z)
+    D, I = nn.kneighbors(qz.reshape(1, -1))
+    D = D.flatten(); I = I.flatten()
+
+    # Gate: if neighbors are far in z-space, return no correction
+    if len(D) == 0:
+        return 0.0, 0
+    if np.percentile(D, 75) > gate_p75:
+        return 0.0, len(D)
+
+    # Gaussian weights
+    bw = np.median(D) if np.median(D) > 0 else (np.mean(D) + 1e-8)
+    w = np.exp(-0.5 * (D / (bw + 1e-8)) ** 2)
+    w = w / (w.sum() + 1e-12)
+    correction = float(np.sum(w * y_res[I]))
+    return correction, len(D)
+
+# =========================================================
+# RUNTIME CALCULATOR PAGE (unchanged except earlier fix)
+# =========================================================
 def runtime_calculator_page():
     st.title("Production Runtime Calculator")
     with st.form("runtime_form"):
         c1, c2, c3 = st.columns(3)
         with c1:
-            length_ft = decimal_input("Wire Length (ft)", 12000.0, "rt_len", min_value=0.0)
+            length_ft = decimal_input("Finished Feet (ft)", 12000.0, "rt_len", min_value=0.0)
         with c2:
             speed_fpm = decimal_input("Line Speed (FPM)", 18.0, "rt_speed", min_value=1.0)
         with c3:
             efficiency_pct = decimal_input("Process Efficiency (%)", 85.0, "rt_eff", min_value=50.0, max_value=100.0)
-        c4, c5, c6 = st.columns(3)
+        c4, c5 = st.columns(2)
         with c4:
             startup_min = decimal_input("Startup Time (min)", 30.0, "rt_start", min_value=0.0)
         with c5:
             shutdown_min = decimal_input("Shutdown Time (min)", 15.0, "rt_stop", min_value=0.0)
-        with c6:
-            passes = int(st.number_input("Number of Passes", min_value=1, value=1, step=1))
         go_btn = st.form_submit_button("Calculate Runtime")
     if go_btn:
         if None in (length_ft, speed_fpm, efficiency_pct, startup_min, shutdown_min):
             st.error("Please complete all inputs.")
             return
-        prod_min = (length_ft * passes) / speed_fpm
+        prod_min = length_ft / speed_fpm
         eff_prod_min = prod_min / (efficiency_pct / 100.0)
         total_min = eff_prod_min + startup_min + shutdown_min
         total_hr = total_min / 60.0
         eff_speed = speed_fpm * (efficiency_pct / 100.0)
         hr_out = eff_speed * 60.0
         day_out = hr_out * 8.0
-        a,b,c,d = st.columns(4)
+        a, b, c, d = st.columns(4)
         a.metric("Production Time", f"{prod_min:.1f} min")
         b.metric("Setup Shutdown", f"{startup_min + shutdown_min:.0f} min")
         c.metric("Total Runtime", f"{total_hr:.2f} hours")
         d.metric("Total minutes", f"{total_min:.1f} min")
-        a,b,c = st.columns(3)
+        a, b, c = st.columns(3)
         a.metric("Effective Speed", f"{eff_speed:.1f} FPM")
         b.metric("Hourly Output", f"{hr_out:,.0f} ft hr")
         c.metric("Daily Output", f"{day_out:,.0f} ft day")
     st.markdown("Typical line speeds  \nFine <0.010 in 15 to 25 FPM  0.010 to 0.050 in 12 to 20 FPM  Larger than 0.050 in 8 to 15 FPM.")
 
-# ================================
-# COPPER WIRE CONVERTER PAGE
-# ================================
+# =========================================================
+# COPPER WIRE CONVERTER PAGE (unchanged)
+# =========================================================
 def copper_wire_converter_page():
     st.title("Copper Wire Length and Weight")
     mode = st.radio("Choose converter", ["Feet to Pounds", "Pounds to Feet"], horizontal=True, index=0)
@@ -451,9 +612,9 @@ def copper_wire_converter_page():
             st.metric("Estimated Length", f"{feet:,.0f} ft")
             st.caption(f"Linear Density {(pounds/feet) if feet>0 else 0:.5f} lb per ft")
 
-# ================================
-# COATED COPPER CONVERTER PAGE
-# ================================
+# =========================================================
+# COATED COPPER CONVERTER PAGE (unchanged)
+# =========================================================
 def coated_copper_converter_page():
     st.title("Coated Copper Length and Weight")
     mode = st.radio("Choose converter", ["Feet to Pounds", "Pounds to Feet"], horizontal=True, index=0)
@@ -498,9 +659,9 @@ def coated_copper_converter_page():
             st.metric("Net Wire Weight", f"{net_lb:,.3f} lb")
             st.metric("Estimated Length", f"{feet:,.0f} ft")
 
-# ================================
-# PAA USAGE PAGE
-# ================================
+# =========================================================
+# PAA USAGE PAGE (unchanged from your last working version)
+# =========================================================
 def paa_usage_page():
     st.title("PAA Usage Calculator")
 
@@ -574,9 +735,9 @@ def paa_usage_page():
         b.metric("Heel Mass", f"{heel_mass_lb:,.3f} lb")
         c.metric("Total with Allowance", f"{total_with_allowance_lb:,.4f} lb")
 
-# ================================
-# ANNEAL TEMP ESTIMATOR PAGE
-# ================================
+# =========================================================
+# ANNEAL TEMP ESTIMATOR PAGE (unchanged from your improved version)
+# =========================================================
 def anneal_temp_estimator_page():
     st.title("Advanced Annealing Temperature Estimator")
     st.markdown(
@@ -751,7 +912,6 @@ def anneal_temp_estimator_page():
             f"Distance stats z space median {np.median(D):.2f}  p75 {pr75:.2f}  out of range {out_of_range}  k {k_neighbors}  weighting {weight_method}"
         )
 
-        # Uncertainty band from neighbors
         try:
             weighted_mean = T_knn
             weighted_var = float(np.sum(w * (neigh_temps - weighted_mean) ** 2))
@@ -779,9 +939,9 @@ def anneal_temp_estimator_page():
                 })
             )
 
-# ================================
+# =========================================================
 # MAIN APP
-# ================================
+# =========================================================
 def main():
     st.sidebar.title("Zeus Polyimide Process Suite")
     page = st.sidebar.radio(
@@ -814,10 +974,11 @@ def main():
     st.sidebar.info("""
 Zeus Polyimide Process Suite
 
-This build adds three improvements.
-Reverse calculator on Wire Diameter to compute required start OD from a desired final.
-Anneal Temp Estimator shows a local uncertainty band from neighbor spread.
-GitHub saves now retry and always write a local fallback to protect history.
+• Wire Diameter Predictor now includes Payoff Type and Payoff Tension, keeps passes, and uses a stress-based scale.
+• Reverse calculator solves iteratively since tension depends on start OD.
+• Optional residual “learning” correction leverages saved runs (off by default).
+• GitHub saves retry and always write a local fallback to protect history.
+• Other modules unchanged.
     """)
 
 if __name__ == "__main__":
