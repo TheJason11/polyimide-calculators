@@ -114,13 +114,7 @@ def thermal_strain(delta_f, material="copper"):
     return 0.0
 
 # ================================
-# GitHub CSV helpers (shared)
-# Set secrets in Streamlit Cloud:
-# [gh]
-# token="YOUR_PAT"
-# owner="YourUser"
-# repo="YourRepo"
-# branch="main"
+# GitHub CSV helpers
 # ================================
 GH = st.secrets.get("gh", {})
 GH_TOKEN = GH.get("token", "")
@@ -185,11 +179,7 @@ def save_row(path: str, local_fallback: Path, cols: list[str], row: dict, commit
         return False
 
 # =========================================================
-# NEW: WIRE DIAMETER PREDICTOR (REPLACED MODULE – 5 inputs)
-#   Final OD from start OD and process stretch
-#   Stretch model: base_mech + base_thermal, scaled by alpha
-#   Quick Calibrate Alpha updates the field
-#   Save Run to GitHub CSV (or local fallback)
+# WIRE DIAMETER PREDICTOR
 # =========================================================
 WIRE_FILE = "wire_diameter_runs.csv"
 WIRE_LOCAL = Path("wire_diameter_runs.csv")
@@ -206,7 +196,6 @@ WIRE_COLS = [
     "notes",
 ]
 
-# Session defaults for predictor
 if "alpha" not in st.session_state:
     st.session_state["alpha"] = 1.0
 if "use_isotonic" not in st.session_state:
@@ -215,12 +204,10 @@ if "use_isotonic" not in st.session_state:
 BASELINE_ACTIVATION_F = 650.0
 
 def _base_unscaled_stretch_in(d0_in: float, passes: int, speed_fpm: float, ht_ft: float, temp_f: float) -> float:
-    # Mechanical: grows with passes, weakly with speed
     mech = 0.000012 * passes * (1.0 + 0.08 * math.log(max(speed_fpm, 1.0)))
-    # Thermal activation above baseline; increases with height, decreases with speed
     act = max(0.0, temp_f - BASELINE_ACTIVATION_F)
     therm = (0.00000035 * passes * ht_ft * act) / max(speed_fpm, 1.0)
-    return mech + therm  # inches of diameter reduction before alpha
+    return mech + therm
 
 def _predict_final_od(d0_in: float, passes: int, speed_fpm: float, ht_ft: float, temp_f: float, alpha: float) -> float:
     raw_stretch = _base_unscaled_stretch_in(d0_in, passes, speed_fpm, ht_ft, temp_f)
@@ -241,8 +228,14 @@ def wire_diameter_predictor_page():
         anneal_temp = decimal_input("Anneal Temperature (°F)", 800.0, "wd_temp", min_value=400.0, max_value=1200.0)
 
         st.markdown("**Model**")
-        alpha = decimal_input("Alpha stretch factor", st.session_state["alpha"], "wd_alpha", min_value=1e-6, max_value=1e-1,
-                              help="Scale on total stretch. Use Quick Calibrate to set it from a known run.")
+        alpha = decimal_input(
+            "Alpha stretch factor",
+            st.session_state["alpha"],
+            "wd_alpha",
+            min_value=1e-6,
+            max_value=10.0,  # widened so 1.000 does not warn
+            help="Scale on total stretch. Use Quick Calibrate to set it from a known run."
+        )
 
         col_pred, col_save = st.columns(2)
         do_predict = col_pred.button("Predict Final Diameter", use_container_width=True)
@@ -259,24 +252,30 @@ def wire_diameter_predictor_page():
         do_solve = st.button("Solve Alpha From This Run", use_container_width=True)
 
         st.markdown("**Recent history**")
-        hist_df = load_csv(WIRE_FILE, WIRE_LOCAL, WIRE_COLS)
-        if hist_df is not None and len(hist_df) > 0:
-            show_cols = [
-                "date_time",
-                "starting_diameter_in",
-                "passes",
-                "line_speed_fpm",
-                "annealer_height_ft",
-                "annealer_temp_F",
-                "pred_final_od_in",
-                "actual_final_od_in",
-                "alpha_used",
-            ]
-            st.dataframe(hist_df.tail(15)[show_cols], use_container_width=True, height=360)
-        else:
-            st.info("No history yet (wire_diameter_runs.csv)")
+        try:
+            hist_df = load_csv(WIRE_FILE, WIRE_LOCAL, WIRE_COLS)
+            if isinstance(hist_df, pd.DataFrame) and not hist_df.empty:
+                show_cols = [
+                    "date_time",
+                    "starting_diameter_in",
+                    "passes",
+                    "line_speed_fpm",
+                    "annealer_height_ft",
+                    "annealer_temp_F",
+                    "pred_final_od_in",
+                    "actual_final_od_in",
+                    "alpha_used",
+                ]
+                avail = [c for c in show_cols if c in hist_df.columns]
+                if avail:
+                    st.dataframe(hist_df.tail(15)[avail], use_container_width=True, height=360)
+                else:
+                    st.info("History file found but its columns do not match the expected schema.")
+            else:
+                st.info("No history yet (wire_diameter_runs.csv)")
+        except Exception as e:
+            st.warning(f"Could not display history: {e}")
 
-    # Solve alpha from a known run (auto-updates the input)
     if do_solve:
         if None in (cal_d0, cal_df, cal_speed, cal_ht, cal_temp):
             st.error("Please complete all calibration inputs.")
@@ -290,7 +289,6 @@ def wire_diameter_predictor_page():
                 st.session_state["wd_alpha"] = str(solved_alpha)
                 st.success(f"Solved alpha = {solved_alpha:.6f}. The Alpha field has been updated.")
 
-    # Predict
     if do_predict:
         if None in (d0, speed, annealer_ht, anneal_temp, alpha):
             st.error("Please complete all inputs.")
@@ -307,7 +305,6 @@ def wire_diameter_predictor_page():
             except Exception as e:
                 st.error(f"Prediction failed: {e}")
 
-    # Save run to CSV (GitHub or local)
     if do_save:
         if None in (d0, speed, annealer_ht, anneal_temp, alpha):
             st.error("Please complete all inputs before saving.")
@@ -335,7 +332,7 @@ def wire_diameter_predictor_page():
                 st.error(f"Save failed: {e}")
 
 # ================================
-# PAGES FROM PRIOR BUILD (unchanged)
+# RUNTIME CALCULATOR
 # ================================
 def runtime_calculator_page():
     st.title("Production Runtime Calculator")
@@ -374,9 +371,12 @@ def runtime_calculator_page():
         a,b,c = st.columns(3)
         a.metric("Effective Speed", f"{eff_speed:.1f} FPM")
         b.metric("Hourly Output", f"{hr_out:,.0f} ft hr")
-        c.metric("Daily Output", f"{day_out:,.0f} ft day")
+        c.metric("Daily Output", f"{day_out::,.0f} ft day")
     st.markdown("Typical line speeds  \nFine <0.010 in 15 to 25 FPM  0.010 to 0.050 in 12 to 20 FPM  Larger than 0.050 in 8 to 15 FPM.")
 
+# ================================
+# COPPER WIRE CONVERTER
+# ================================
 def copper_wire_converter_page():
     st.title("Copper Wire Weight Calculator")
     method = st.radio("Input Method", ["Diameter", "AWG"], horizontal=True)
@@ -409,6 +409,9 @@ def copper_wire_converter_page():
         b.metric("Weight per Foot", f"{wpf:.5f} lb ft")
         c.metric("Cross Section", f"{area:.6f} in²")
 
+# ================================
+# COATED COPPER CONVERTER
+# ================================
 def coated_copper_converter_page():
     st.title("Coated Wire Weight Calculator")
     with st.form("coat_form"):
@@ -456,7 +459,7 @@ def coated_copper_converter_page():
         d.metric("With Scrap", f"{wt_scrap:.3f} lbs")
 
 # ================================
-# ANNEAL TEMP ESTIMATOR (unchanged)
+# ANNEAL TEMP ESTIMATOR
 # ================================
 def anneal_temp_estimator_page():
     st.title("Advanced Annealing Temperature Estimator")
@@ -679,7 +682,7 @@ def main():
     st.sidebar.info("""
 Zeus Polyimide Process Suite
 
-This build updates the Wire Diameter Predictor to a 5-input model with Quick Calibrate Alpha and CSV logging to GitHub (wire_diameter_runs.csv). All other tools remain unchanged.
+This build updates the Wire Diameter Predictor to a 5 input model with Quick Calibrate Alpha and CSV logging to GitHub. All other tools remain unchanged.
     """)
 
 if __name__ == "__main__":
