@@ -1,13 +1,19 @@
 # app.py
 # Zeus Polyimide Process Suite
-# Wire Diameter Predictor with auto CSV discovery and robust history loading
+# Wire Diameter Predictor with GitHub hosted CSV read and write
+# Five required inputs, Predict works, Quick Calibrate Alpha updates automatically
+# History loads from GitHub CSV, Save Run appends back to GitHub CSV via API
+# If GitHub secrets are missing, falls back to local CSV next to app.py
 
+import base64
+import json
 import math
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
 from sklearn.isotonic import IsotonicRegression
 
@@ -19,44 +25,47 @@ st.set_page_config(
 )
 
 # =========================================
+# Config via Secrets
+# =========================================
+# Set these in Streamlit Cloud: Settings -> Secrets
+# [gh]
+# token = "ghp_xxx"
+# owner = "TheJason11"
+# repo = "polyimide-calculators"
+# branch = "main"
+# path = "wire_diameter_runs.csv"
+def _get_secret(path, default=None):
+    try:
+        return st.secrets
+    except Exception:
+        return {}
+
+GH = st.secrets.get("gh", {})
+GH_TOKEN = GH.get("token", "")
+GH_OWNER = GH.get("owner", "")
+GH_REPO = GH.get("repo", "")
+GH_BRANCH = GH.get("branch", "main")
+GH_PATH = GH.get("path", "wire_diameter_runs.csv")
+
+RAW_URL = ""
+API_URL = ""
+if GH_OWNER and GH_REPO and GH_PATH:
+    RAW_URL = f"https://raw.githubusercontent.com/{GH_OWNER}/{GH_REPO}/{GH_BRANCH}/{GH_PATH}"
+    API_URL = f"https://api.github.com/repos/{GH_OWNER}/{GH_REPO}/contents/{GH_PATH}"
+
+# Local fallback filename if no secrets are set or API write fails
+LOCAL_CSV = Path("wire_diameter_runs.csv")
+
+# =========================================
 # Session State Defaults
 # =========================================
 def _ensure_state():
     if "alpha" not in st.session_state:
         st.session_state.alpha = 1.0
-    if "default_csv_path" not in st.session_state:
-        st.session_state.default_csv_path = "wire_diameter_runs.csv"
     if "use_isotonic" not in st.session_state:
         st.session_state.use_isotonic = True
 
 _ensure_state()
-
-# =========================================
-# Utility
-# =========================================
-CSV_BASENAME = "wire_diameter_runs.csv"
-
-def find_csv(start_dir: Path, name: str) -> Path | None:
-    """Search common spots for the CSV: cwd, data subfolder, and up to three parents."""
-    candidates = [
-        start_dir / name,
-        start_dir / "data" / name,
-    ]
-    # Walk up to three parents and check both direct and data subfolder
-    p = start_dir
-    for _ in range(3):
-        p = p.parent
-        candidates.append(p / name)
-        candidates.append(p / "data" / name)
-
-    for c in candidates:
-        if c.exists() and c.is_file():
-            return c.resolve()
-    return None
-
-def ensure_path_from_textbox(path_str: str) -> Path:
-    p = Path(path_str).expanduser()
-    return p
 
 # =========================================
 # Modeling Core
@@ -105,14 +114,11 @@ HISTORY_COLUMNS = [
     "notes",
 ]
 
-def load_history(csv_path: Path) -> pd.DataFrame | None:
-    if not csv_path.exists():
+def load_history_from_github() -> pd.DataFrame | None:
+    if not RAW_URL:
         return None
     try:
-        df = pd.read_csv(
-            csv_path,
-            na_values=["", " ", "NA", "N/A", "None", "null"],
-        )
+        df = pd.read_csv(RAW_URL, na_values=["", " ", "NA", "N/A", "None", "null"])
         missing = set(HISTORY_COLUMNS) - set(df.columns)
         if missing:
             return None
@@ -120,12 +126,70 @@ def load_history(csv_path: Path) -> pd.DataFrame | None:
     except Exception:
         return None
 
-def save_run_row(csv_path: Path, row: dict):
-    df_row = pd.DataFrame([{k: row.get(k, "") for k in HISTORY_COLUMNS}])
-    if not csv_path.exists():
-        df_row.to_csv(csv_path, index=False)
+def load_history_local() -> pd.DataFrame | None:
+    if not LOCAL_CSV.exists():
+        return None
+    try:
+        df = pd.read_csv(LOCAL_CSV, na_values=["", " ", "NA", "N/A", "None", "null"])
+        missing = set(HISTORY_COLUMNS) - set(df.columns)
+        if missing:
+            return None
+        return df
+    except Exception:
+        return None
+
+def github_get_file_sha() -> str | None:
+    if not API_URL or not GH_TOKEN:
+        return None
+    headers = {"Authorization": f"token {GH_TOKEN}"}
+    r = requests.get(API_URL, headers=headers)
+    if r.status_code == 200:
+        return r.json().get("sha")
+    return None
+
+def github_upsert_csv(new_df: pd.DataFrame, commit_message: str) -> bool:
+    if not API_URL or not GH_TOKEN:
+        return False
+    headers = {"Authorization": f"token {GH_TOKEN}"}
+    existing_sha = github_get_file_sha()
+    content_bytes = new_df.to_csv(index=False).encode("utf-8")
+    payload = {
+        "message": commit_message,
+        "content": base64.b64encode(content_bytes).decode("utf-8"),
+        "branch": GH_BRANCH,
+    }
+    if existing_sha:
+        payload["sha"] = existing_sha
+    r = requests.put(API_URL, headers=headers, data=json.dumps(payload))
+    return r.status_code in (200, 201)
+
+def save_run_row(row: dict, commit_message: str = "append wire diameter run") -> bool:
+    # Try GitHub first if configured
+    hist = load_history_from_github()
+    if hist is None:
+        # Try local fallback existence
+        if LOCAL_CSV.exists():
+            hist = load_history_local()
+    # Build the new row DataFrame with correct column order
+    row_df = pd.DataFrame([{k: row.get(k, "") for k in HISTORY_COLUMNS}])
+    if hist is None:
+        combined = row_df
     else:
-        df_row.to_csv(csv_path, mode="a", header=False, index=False)
+        combined = pd.concat([hist, row_df], ignore_index=True)
+    # Attempt GitHub write if token present
+    if GH_TOKEN and API_URL:
+        ok = github_upsert_csv(combined, commit_message)
+        if ok:
+            return True
+    # Fallback to local file write
+    try:
+        if not LOCAL_CSV.exists():
+            combined.to_csv(LOCAL_CSV, index=False)
+        else:
+            combined.to_csv(LOCAL_CSV, index=False)
+        return True
+    except Exception:
+        return False
 
 # =========================================
 # Layout
@@ -140,32 +204,19 @@ tabs = st.tabs([
 with tabs[0]:
     st.subheader("Wire Diameter Predictor")
 
-    cfg_col, iso_col, loc_col = st.columns([1.6, 1.1, 0.9])
+    src_col, iso_col = st.columns([1.6, 1.0])
+    with src_col:
+        st.write("Data source")
+        if RAW_URL:
+            st.caption(f"GitHub CSV: {RAW_URL}")
+        else:
+            st.caption("Local CSV fallback: wire_diameter_runs.csv")
 
-    with cfg_col:
-        csv_path_str = st.text_input(
-            "CSV path for saved runs",
-            value=st.session_state.default_csv_path,
-            help="File is created on first save then appended",
-        )
     with iso_col:
         st.session_state.use_isotonic = st.checkbox(
             "Use isotonic correction when history has actuals",
             value=st.session_state.use_isotonic,
         )
-    with loc_col:
-        locate = st.button("Locate CSV")
-
-    # Auto discovery on first load or when locate is pressed
-    csv_path = ensure_path_from_textbox(csv_path_str)
-    if (not csv_path.exists()) or locate:
-        found = find_csv(Path.cwd(), CSV_BASENAME)
-        if found is not None:
-            csv_path = found
-            st.session_state.default_csv_path = str(found)
-            st.success(f"Found CSV at {found}")
-        else:
-            st.info(f"No existing {CSV_BASENAME} found yet. It will be created on first Save Run.")
 
     left, right = st.columns([1.2, 1.0])
 
@@ -209,7 +260,7 @@ with tabs[0]:
         user_notes = st.text_area("Notes", value="", height=100)
 
         st.markdown("**Recent history**")
-        hist_df = load_history(csv_path)
+        hist_df = load_history_from_github() or load_history_local()
         if hist_df is not None and len(hist_df) > 0:
             show_cols = [
                 "date_time",
@@ -301,11 +352,14 @@ with tabs[0]:
                 "alpha_used": float(alpha_val),
                 "notes": user_notes,
             }
-            save_run_row(Path(st.session_state.default_csv_path), row)
-            st.success(f"Saved to {Path(st.session_state.default_csv_path).resolve()}")
+            ok = save_run_row(row, commit_message="append wire diameter run")
+            if ok:
+                st.success("Saved run to GitHub CSV" if GH_TOKEN else "Saved run to local CSV")
+            else:
+                st.error("Save failed")
         except Exception as e:
             st.error(f"Save failed: {e}")
 
 with tabs[1]:
     st.subheader("Other Modules")
-    st.info("Placeholders for other tools. This tab remains unchanged in this version.")
+    st.info("Placeholders for other tools.")
