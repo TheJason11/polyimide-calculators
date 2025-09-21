@@ -1,10 +1,6 @@
 # app.py
 # Zeus Polyimide Process Suite
-# Full file replacement focused on a reliable Wire Diameter Predictor
-# Five required inputs
-# Predict works
-# Quick Calibrate Alpha updates the model value automatically
-# Save Run creates and appends to a CSV with a fixed header
+# Wire Diameter Predictor with auto CSV discovery and robust history loading
 
 import math
 from datetime import datetime
@@ -36,31 +32,45 @@ def _ensure_state():
 _ensure_state()
 
 # =========================================
+# Utility
+# =========================================
+CSV_BASENAME = "wire_diameter_runs.csv"
+
+def find_csv(start_dir: Path, name: str) -> Path | None:
+    """Search common spots for the CSV: cwd, data subfolder, and up to three parents."""
+    candidates = [
+        start_dir / name,
+        start_dir / "data" / name,
+    ]
+    # Walk up to three parents and check both direct and data subfolder
+    p = start_dir
+    for _ in range(3):
+        p = p.parent
+        candidates.append(p / name)
+        candidates.append(p / "data" / name)
+
+    for c in candidates:
+        if c.exists() and c.is_file():
+            return c.resolve()
+    return None
+
+def ensure_path_from_textbox(path_str: str) -> Path:
+    p = Path(path_str).expanduser()
+    return p
+
+# =========================================
 # Modeling Core
 # =========================================
 BASELINE_ACTIVATION_F = 650.0
 
-# The base unscaled stretch captures:
-# 1. More passes increase stretch
-# 2. Higher speed reduces thermal dwell which reduces stretch
-# 3. Taller annealer and hotter temperature increase stretch
-# Alpha scales the total effect and is calibrated from real runs
 def base_unscaled_stretch_in(start_od_in: float,
                              passes: int,
                              speed_fpm: float,
                              anneal_height_ft: float,
                              anneal_temp_f: float) -> float:
-    # Mechanical part grows with passes and weakly with speed
     mech = 0.00002 * passes * (1.0 + 0.1 * math.log(max(speed_fpm, 1.0)))
-
-    # Thermal activation only above baseline
     act = max(0.0, anneal_temp_f - BASELINE_ACTIVATION_F)
-
-    # Thermal part increases with passes, annealer height, and activation
-    # and decreases with speed due to shorter dwell
     therm = (0.0000006 * passes * anneal_height_ft * act) / max(speed_fpm, 1.0)
-
-    # Total base stretch before alpha scaling in inches of diameter reduction
     return mech + therm
 
 def predict_final_od(start_od_in: float,
@@ -74,51 +84,44 @@ def predict_final_od(start_od_in: float,
     final_od = max(0.0, start_od_in - stretch_scaled)
     return final_od
 
-# Optional isotonic bias correction
-# Trains a monotonic mapping from raw predicted to actual using historical rows
 def isotonic_correct(raw_pred: np.ndarray, actual: np.ndarray, new_raw_pred: float) -> float:
     ir = IsotonicRegression(out_of_bounds="clip")
     ir.fit(raw_pred, actual)
     return float(ir.predict([new_raw_pred])[0])
 
-# Load historical data if present
-def load_history(csv_path: Path) -> pd.DataFrame | None:
-    if csv_path.exists():
-        try:
-            df = pd.read_csv(csv_path)
-            needed = {
-                "date_time",
-                "starting_diameter_in",
-                "passes",
-                "line_speed_fpm",
-                "annealer_height_ft",
-                "annealer_temp_F",
-                "pred_final_od_in",
-                "actual_final_od_in",
-                "alpha_used",
-                "notes",
-            }
-            if needed.issubset(set(df.columns)):
-                return df
-        except Exception:
-            return None
-    return None
+# =========================================
+# History IO
+# =========================================
+HISTORY_COLUMNS = [
+    "date_time",
+    "starting_diameter_in",
+    "passes",
+    "line_speed_fpm",
+    "annealer_height_ft",
+    "annealer_temp_F",
+    "pred_final_od_in",
+    "actual_final_od_in",
+    "alpha_used",
+    "notes",
+]
 
-# Save a single row to CSV with consistent header and ordering
+def load_history(csv_path: Path) -> pd.DataFrame | None:
+    if not csv_path.exists():
+        return None
+    try:
+        df = pd.read_csv(
+            csv_path,
+            na_values=["", " ", "NA", "N/A", "None", "null"],
+        )
+        missing = set(HISTORY_COLUMNS) - set(df.columns)
+        if missing:
+            return None
+        return df
+    except Exception:
+        return None
+
 def save_run_row(csv_path: Path, row: dict):
-    columns = [
-        "date_time",
-        "starting_diameter_in",
-        "passes",
-        "line_speed_fpm",
-        "annealer_height_ft",
-        "annealer_temp_F",
-        "pred_final_od_in",
-        "actual_final_od_in",
-        "alpha_used",
-        "notes",
-    ]
-    df_row = pd.DataFrame([{k: row.get(k, "") for k in columns}])
+    df_row = pd.DataFrame([{k: row.get(k, "") for k in HISTORY_COLUMNS}])
     if not csv_path.exists():
         df_row.to_csv(csv_path, index=False)
     else:
@@ -137,34 +140,52 @@ tabs = st.tabs([
 with tabs[0]:
     st.subheader("Wire Diameter Predictor")
 
-    # File location and options
-    cfg_col, iso_col = st.columns([1.5, 1])
+    cfg_col, iso_col, loc_col = st.columns([1.6, 1.1, 0.9])
+
     with cfg_col:
         csv_path_str = st.text_input(
             "CSV path for saved runs",
             value=st.session_state.default_csv_path,
-            help="File is created on first save then appended"
+            help="File is created on first save then appended",
         )
     with iso_col:
         st.session_state.use_isotonic = st.checkbox(
             "Use isotonic correction when history has actuals",
-            value=st.session_state.use_isotonic
+            value=st.session_state.use_isotonic,
         )
+    with loc_col:
+        locate = st.button("Locate CSV")
 
-    csv_path = Path(csv_path_str)
+    # Auto discovery on first load or when locate is pressed
+    csv_path = ensure_path_from_textbox(csv_path_str)
+    if (not csv_path.exists()) or locate:
+        found = find_csv(Path.cwd(), CSV_BASENAME)
+        if found is not None:
+            csv_path = found
+            st.session_state.default_csv_path = str(found)
+            st.success(f"Found CSV at {found}")
+        else:
+            st.info(f"No existing {CSV_BASENAME} found yet. It will be created on first Save Run.")
 
     left, right = st.columns([1.2, 1.0])
 
     with left:
         st.markdown("**Inputs**")
-        start_od_in = st.number_input("Starting diameter in", min_value=0.00000, value=0.04200, step=0.00010, format="%.5f")
+        start_od_in = st.number_input("Starting diameter in", min_value=0.00000, value=0.04210, step=0.00010, format="%.5f")
         passes = st.number_input("Number of passes", min_value=1, value=30, step=1)
         speed_fpm = st.number_input("Line speed fpm", min_value=1.0, value=18.0, step=1.0, format="%.2f")
         anneal_height_ft = st.number_input("Annealer height ft", min_value=1.0, value=14.0, step=1.0, format="%.2f")
         anneal_temp_f = st.number_input("Annealer temperature F", min_value=200.0, value=800.0, step=5.0, format="%.1f")
 
         st.markdown("**Model**")
-        alpha = st.number_input("Alpha stretch factor", min_value=0.000, value=float(st.session_state.alpha), step=0.010, format="%.3f", key="alpha_input")
+        alpha = st.number_input(
+            "Alpha stretch factor",
+            min_value=0.000,
+            value=float(st.session_state.alpha),
+            step=0.010,
+            format="%.3f",
+            key="alpha_input",
+        )
 
         col_pred, col_save = st.columns([1, 1])
         with col_pred:
@@ -180,14 +201,13 @@ with tabs[0]:
             value=0.04100,
             step=0.00010,
             format="%.5f",
-            help="Enter a known final OD from a real run to solve the alpha"
+            help="Enter a known final OD from a real run to solve the alpha",
         )
         solve_alpha_click = st.button("Solve Alpha from Actual", use_container_width=True)
 
         st.markdown("**Notes for save**")
         user_notes = st.text_area("Notes", value="", height=100)
 
-        # History preview
         st.markdown("**Recent history**")
         hist_df = load_history(csv_path)
         if hist_df is not None and len(hist_df) > 0:
@@ -207,22 +227,21 @@ with tabs[0]:
             st.info("No history yet")
 
     # Actions
-    # Solve alpha
     if solve_alpha_click:
         try:
-            stretch_unscaled = base_unscaled_stretch_in(start_od_in, int(passes), float(speed_fpm), float(anneal_height_ft), float(anneal_temp_f))
+            stretch_unscaled = base_unscaled_stretch_in(
+                float(start_od_in), int(passes), float(speed_fpm), float(anneal_height_ft), float(anneal_temp_f)
+            )
             if stretch_unscaled <= 0:
-                st.error("Cannot solve alpha because base stretch is zero. Check inputs")
+                st.error("Cannot solve alpha because base stretch is zero. Check inputs.")
             else:
-                solved_alpha = (start_od_in - actual_for_cal) / stretch_unscaled
-                # Update both session state and the visible input
+                solved_alpha = (float(start_od_in) - float(actual_for_cal)) / float(stretch_unscaled)
                 st.session_state.alpha = float(solved_alpha)
                 st.session_state.alpha_input = float(solved_alpha)
                 st.success(f"Solved alpha set to {solved_alpha:.5f}")
         except Exception as e:
             st.error(f"Alpha solve failed: {e}")
 
-    # Predict
     if predict_click:
         try:
             alpha_val = float(st.session_state.get("alpha_input", st.session_state.alpha))
@@ -236,7 +255,6 @@ with tabs[0]:
             )
 
             corrected = raw_pred
-            # Apply isotonic only if enabled and if we have rows with both raw pred and actual
             if st.session_state.use_isotonic and hist_df is not None:
                 valid = hist_df.dropna(subset=["pred_final_od_in", "actual_final_od_in"])
                 if len(valid) >= 5:
@@ -254,15 +272,11 @@ with tabs[0]:
             with c1:
                 st.metric(label="Raw predicted final OD in", value=f"{raw_pred:.5f}")
             with c2:
-                if corrected != raw_pred:
-                    st.metric(label="Isotonic corrected final OD in", value=f"{corrected:.5f}")
-                else:
-                    st.metric(label="Corrected final OD in", value=f"{corrected:.5f}")
+                st.metric(label="Corrected final OD in", value=f"{corrected:.5f}")
 
         except Exception as e:
             st.error(f"Prediction failed: {e}")
 
-    # Save
     if save_click:
         try:
             alpha_val = float(st.session_state.get("alpha_input", st.session_state.alpha))
@@ -287,8 +301,8 @@ with tabs[0]:
                 "alpha_used": float(alpha_val),
                 "notes": user_notes,
             }
-            save_run_row(Path(csv_path), row)
-            st.success(f"Saved to {csv_path}")
+            save_run_row(Path(st.session_state.default_csv_path), row)
+            st.success(f"Saved to {Path(st.session_state.default_csv_path).resolve()}")
         except Exception as e:
             st.error(f"Save failed: {e}")
 
