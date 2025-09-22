@@ -1,4 +1,5 @@
 date_time,starting_diameter_in,passes,line_speed_fpm,annealer_height_ft,annealer_temp_F,payoff_type,payoff_tension_lb,pred_final_od_in,actual_final_od_in,alpha_used,notes
 2025-09-20 10:30:00,0.0823,30,8.0,14.0,825.0,"22"" Spool",10.0,0.0811,0.081,0.26,benchmark run
 2025-09-20 11:00:00,0.0415,10,15.0,14.0,825.0,Large,2.0,0.0411,0.041,0.7,benchmark run
-2025-09-21 23:14:44,0.0415,10,15.0,14.0,825.0,Large,2.0,0.041001819319493565,,0.7,
+2025-09-21 23:14:44,0.0415,10,15.0,14.0,825.0,Large,2.0,0.0410018193194935,,0.7,
+2025-09-22 13:46:13,0.0825,30,10.0,14.0,850.0,"22"" Spool",10.0,0.0803,,0.44507134860707875,
