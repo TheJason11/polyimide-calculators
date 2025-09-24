@@ -298,10 +298,6 @@ def reverse_required_start(
             anneal_ht_ft, anneal_temp_f, payoff_type, payoff_tension_lb,
             A, B, kA, kB, TrefA, TrefB
         )
-        # newton like update by inverting local sensitivity
-        # sensitivity of final to start is approximately 1 minus d(delta)/d(start)
-        # delta depends on sigma which is proportional to 1/d0^2
-        # use a small fixed relaxation to keep simple and robust
         err = target_final_in - pred
         if abs(err) < tol:
             break
