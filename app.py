@@ -177,9 +177,8 @@ def save_row(path: str, local_fallback: Path, cols: list[str], row: dict, commit
         st.warning("Remote save to GitHub did not confirm. Local file was written.")
 
     return local_ok or remote_ok
-
 # =========================================================
-# WIRE DIAMETER PREDICTOR (REVISED)
+# WIRE DIAMETER PREDICTOR
 # =========================================================
 WIRE_FILE = "wire_diameter_runs.csv"
 WIRE_LOCAL = Path("wire_diameter_runs.csv")
@@ -205,6 +204,11 @@ WIRE_COLS = [
     "notes",
 ]
 
+# session defaults for model parameters
+if "A_param" not in st.session_state:
+    st.session_state["A_param"] = 1.0e-8
+if "B_param" not in st.session_state:
+    st.session_state["B_param"] = 1.0e-9
 if "kA_param" not in st.session_state:
     st.session_state["kA_param"] = 0.0
 if "kB_param" not in st.session_state:
@@ -215,22 +219,6 @@ if "TrefB_param" not in st.session_state:
     st.session_state["TrefB_param"] = 500.0
 if "use_residual_learning" not in st.session_state:
     st.session_state["use_residual_learning"] = False
-
-auto_fit = None
-try:
-    auto_fit = None
-except Exception:
-    auto_fit = None
-
-if auto_fit is not None:
-    a_hat, b_hat, rmse, n = auto_fit
-    st.session_state["A_param"] = a_hat
-    st.session_state["B_param"] = b_hat
-else:
-    if "A_param" not in st.session_state:
-        st.session_state["A_param"] = 1.0e-8
-    if "B_param" not in st.session_state:
-        st.session_state["B_param"] = 1.0e-9
 
 SPOOL_MULT_LARGE = 1.0
 SPOOL_MULT_22 = 1.6
@@ -308,7 +296,7 @@ def reverse_required_start(
 ) -> float:
     d0 = max(target_final_in + 0.001, 1e-5)
     for _ in range(max_iter):
-        pred, *_ = predict_final_and_parts(
+        pred, dA, dB, sigma, dwell_ann, dwell_ov, phiA, phiB, Tavg = predict_final_and_parts(
             d0, passes, speed_fpm, oven_len_ft, oven_top_f, oven_mid_f, oven_bot_f,
             anneal_ht_ft, anneal_temp_f, payoff_type, payoff_tension_lb,
             A, B, kA, kB, TrefA, TrefB
@@ -318,7 +306,6 @@ def reverse_required_start(
             break
         d0 = max(d0 + 0.8 * err, target_final_in)
     return d0
-
 def _history_df() -> pd.DataFrame | None:
     return load_csv(WIRE_FILE, WIRE_LOCAL, WIRE_COLS)
 
@@ -373,126 +360,318 @@ def fit_A_B_from_history(kA: float, kB: float, TrefA: float, TrefB: float):
     rmse = float(np.sqrt(np.mean((y - y_hat) ** 2)))
     return a_hat, b_hat, rmse, len(df)
 
+def _features_for_residual(
+    d0, passes, speed_fpm, oven_len_ft, oven_top_f, oven_mid_f, oven_bot_f,
+    anneal_ht_ft, anneal_temp_f, tension_lb, payoff_type
+):
+    dwell_ann = _anneal_dwell_s(anneal_ht_ft, speed_fpm)
+    dwell_ov  = _oven_dwell_s(oven_len_ft,  speed_fpm)
+    t_eff = tension_lb * _pay_mult(payoff_type)
+    tavg = (oven_top_f + oven_mid_f + oven_bot_f) / 3.0
+    return np.array([
+        math.log(max(d0, 1e-6)),
+        float(passes),
+        math.log(max(dwell_ann, 1e-6)),
+        math.log(max(dwell_ov,  1e-6)),
+        float(tavg),
+        math.log(max(t_eff, 1e-6)),
+        1.0 if payoff_type == '22" Spool' else 0.0
+    ], dtype=float)
+
+def residual_correction_from_history(
+    d0, passes, speed_fpm, oven_len_ft, oven_top_f, oven_mid_f, oven_bot_f,
+    anneal_ht_ft, anneal_temp_f, tension_lb, payoff_type, A, B, kA, kB, TrefA, TrefB,
+    k: int = 15, gate_p75: float = 1.5
+):
+    hist = _history_df()
+    if hist is None or len(hist) < 12:
+        return 0.0, 0
+    need = [
+        "starting_diameter_in","passes","line_speed_fpm",
+        "oven_hot_length_ft","oven_top_F","oven_mid_F","oven_bot_F",
+        "annealer_height_ft","annealer_temp_F",
+        "payoff_type","payoff_tension_lb","actual_final_od_in"
+    ]
+    for c in need:
+        if c not in hist.columns:
+            return 0.0, 0
+    hist = hist.dropna(subset=need)
+    if len(hist) < 12:
+        return 0.0, 0
+
+    X_list, res_list = [], []
+    for _, r in hist.iterrows():
+        try:
+            d0_i = float(r["starting_diameter_in"])
+            p_i = int(r["passes"])
+            s_i = float(r["line_speed_fpm"])
+            ovlen_i = float(r["oven_hot_length_ft"])
+            top_i = float(r["oven_top_F"]); mid_i = float(r["oven_mid_F"]); bot_i = float(r["oven_bot_F"])
+            ah_i = float(r["annealer_height_ft"])
+            at_i = float(r["annealer_temp_F"])
+            pt_i = str(r["payoff_type"]) if pd.notna(r["payoff_type"]) else "Large"
+            T_i = float(r["payoff_tension_lb"])
+            actual_i = float(r["actual_final_od_in"])
+
+            pred_i, *_ = predict_final_and_parts(
+                d0_i, p_i, s_i, ovlen_i, top_i, mid_i, bot_i, ah_i, at_i, pt_i, T_i,
+                A, B, kA, kB, TrefA, TrefB
+            )
+            X_list.append(_features_for_residual(d0_i, p_i, s_i, ovlen_i, top_i, mid_i, bot_i, ah_i, at_i, T_i, pt_i))
+            res_list.append(actual_i - pred_i)
+        except Exception:
+            continue
+
+    if len(X_list) < 12:
+        return 0.0, 0
+
+    X = np.vstack(X_list)
+    y_res = np.array(res_list, dtype=float)
+
+    mu = X.mean(axis=0)
+    sd = X.std(axis=0, ddof=1)
+    sd[sd == 0] = 1.0
+    Z = (X - mu) / sd
+
+    q = _features_for_residual(d0, passes, speed_fpm, oven_len_ft, oven_top_f, oven_mid_f, oven_bot_f,
+                               anneal_ht_ft, anneal_temp_f, tension_lb, payoff_type)
+    qz = (q - mu) / sd
+
+    k_eff = min(k, len(Z))
+    nn = NearestNeighbors(n_neighbors=k_eff, metric='euclidean').fit(Z)
+    D, I = nn.kneighbors(qz.reshape(1, -1))
+    D = D.flatten(); I = I.flatten()
+
+    if len(D) == 0:
+        return 0.0, 0
+    if np.percentile(D, 75) > gate_p75:
+        return 0.0, len(D)
+
+    bw = np.median(D) if np.median(D) > 0 else (np.mean(D) + 1e-8)
+    w = np.exp(-0.5 * (D / (bw + 1e-8)) ** 2)
+    w = w / (w.sum() + 1e-12)
+    correction = float(np.sum(w * y_res[I]))
+    return correction, len(D)
+
 def wire_diameter_predictor_page():
     st.title("Wire Diameter Predictor")
 
-    with st.expander("Model Calibration", expanded=True):
-        A = decimal_input("A parameter", st.session_state["A_param"], "wd_A")
-        B = decimal_input("B parameter", st.session_state["B_param"], "wd_B")
-        kA = decimal_input("kA", st.session_state["kA_param"], "wd_kA")
-        kB = decimal_input("kB", st.session_state["kB_param"], "wd_kB")
-        TrefA = decimal_input("TrefA (°F)", st.session_state["TrefA_param"], "wd_TrefA")
-        TrefB = decimal_input("TrefB (°F)", st.session_state["TrefB_param"], "wd_TrefB")
+    left, right = st.columns([1.25, 1.0])
 
-        colsE = st.columns(3)
+    with left:
+        st.markdown("**Inputs**")
+        d0 = decimal_input("Starting Diameter in", 0.04210, "wd_d0", min_value=0.001, max_value=0.200)
+        passes = int(st.number_input("Number of Passes", min_value=1, max_value=200, value=30, step=1, key="wd_passes"))
+        speed = decimal_input("Line Speed FPM", 18.0, "wd_speed", min_value=1.0, max_value=100.0)
 
-        if colsE[0].button("Fit A and B from history", use_container_width=True):
-            fitted = fit_A_B_from_history(
-                st.session_state["kA_param"],
-                st.session_state["kB_param"],
-                st.session_state["TrefA_param"],
-                st.session_state["TrefB_param"]
-            )
-            if fitted is None:
-                st.warning("Not enough complete rows with actual final and oven fields.")
-            else:
-                a_hat, b_hat, rmse, n = fitted
-                st.session_state["A_param"] = a_hat
-                st.session_state["B_param"] = b_hat
-                st.session_state["wd_A"] = str(a_hat)
-                st.session_state["wd_B"] = str(b_hat)
-                st.success(f"Fitted A={a_hat:.6e}  B={b_hat:.6e}  RMSE={rmse:.6f} using n={n}")
+        st.markdown("**Thermal hardware**")
+        oven_len = decimal_input("Heated Length per Pass ft", 12.0, "wd_ovlen", min_value=1.0, max_value=60.0)
+        topF = decimal_input("Zone 3 Top Hottest °F", 300.0, "wd_top", min_value=200.0, max_value=1200.0)
+        midF = decimal_input("Zone 2 Middle °F", 550.0, "wd_mid", min_value=200.0, max_value=1200.0)
+        botF = decimal_input("Zone 1 Bottom °F", 700.0, "wd_bot", min_value=200.0, max_value=1200.0)
 
-        if colsE[1].button("Set current as defaults", use_container_width=True):
-            st.session_state["A_param"] = float(A)
-            st.session_state["B_param"] = float(B)
-            st.success("Session defaults updated.")
+        annealer_ht = decimal_input("Annealer Height ft", 14.0, "wd_ht", min_value=1.0, max_value=50.0)
+        anneal_temp = decimal_input("Annealer Temp °F", 825.0, "wd_temp", min_value=400.0, max_value=1200.0)
 
-        if colsE[2].button("Reset to factory defaults", use_container_width=True):
-            st.session_state["A_param"] = 1.0e-8
-            st.session_state["B_param"] = 1.0e-9
-            st.session_state["wd_A"] = str(1.0e-8)
-            st.session_state["wd_B"] = str(1.0e-9)
-            st.success("Factory defaults restored (A=1.0e-8, B=1.0e-9).")
-
-    st.markdown("---")
-
-    with st.expander("Inputs", expanded=True):
-        col1, col2, col3 = st.columns(3)
-        start_dia_in = decimal_input("Starting Diameter (in)", 0.05, "wd_start")
-        passes = col1.number_input("Passes", 1, 100, 10, key="wd_passes")
-        line_speed_fpm = col2.number_input("Line Speed (fpm)", 1, 100, 10, key="wd_speed")
-        oven_hot_length_ft = col3.number_input("Oven Hot Length (ft)", 1, 30, 6, key="wd_ovenlen")
-
-        oven_top_F = col1.number_input("Oven Top °F", 200, 1000, 600, key="wd_top")
-        oven_mid_F = col2.number_input("Oven Mid °F", 200, 1000, 600, key="wd_mid")
-        oven_bot_F = col3.number_input("Oven Bot °F", 200, 1000, 600, key="wd_bot")
-
-        annealer_height_ft = col1.number_input("Annealer Height (ft)", 1, 30, 14, key="wd_annht")
-        annealer_temp_F = col2.number_input("Annealer Temp °F", 200, 1200, 800, key="wd_annt")
-
-        payoff_type = col3.selectbox("Payoff Type", ["Large", "22\" Spool"], key="wd_pay")
-        payoff_tension_lb = col1.number_input("Payoff Tension (lb)", 0, 100, 5, key="wd_tens")
-
-        known_actual = decimal_input("Known Actual for this run (optional)", None, "wd_known")
-
-        notes = st.text_area("Notes", key="wd_notes")
-
-    if st.button("Predict Final Diameter", use_container_width=True):
-        final_d, dA, dB, sigma, dwell_ann, dwell_ov, phiA, phiB, Tavg = predict_final_and_parts(
-            start_dia_in, passes, line_speed_fpm,
-            oven_hot_length_ft, oven_top_F, oven_mid_F, oven_bot_F,
-            annealer_height_ft, annealer_temp_F,
-            payoff_type, payoff_tension_lb,
-            float(A), float(B), float(kA), float(kB), float(TrefA), float(TrefB)
+        payoff_type = st.selectbox("Payoff Type", ['Large', '22" Spool'], index=0, key="wd_payoff")
+        max_tension = 4.0 if payoff_type == 'Large' else 15.0
+        payoff_tension = decimal_input(
+            "Payoff Tension lbf",
+            2.0 if payoff_type == 'Large' else 10.0,
+            "wd_tension",
+            min_value=0.0,
+            max_value=max_tension,
+            help="Large 0 to 4 lbf     22 inch 0 to 15 lbf",
         )
-        st.success(f"Predicted Final Diameter: {final_d:.6f} in")
-        st.caption(f"Contributions: ΔA={dA:.6e}, ΔB={dB:.6e}, σ={sigma:.6f}, dwellA={dwell_ann:.2f}s, dwellB={dwell_ov:.2f}s, φA={phiA:.3f}, φB={phiB:.3f}, Tavg={Tavg:.1f}°F")
 
-    if st.button("Save Run", use_container_width=True):
-        final_d, *_ = predict_final_and_parts(
-            start_dia_in, passes, line_speed_fpm,
-            oven_hot_length_ft, oven_top_F, oven_mid_F, oven_bot_F,
-            annealer_height_ft, annealer_temp_F,
-            payoff_type, payoff_tension_lb,
-            float(A), float(B), float(kA), float(kB), float(TrefA), float(TrefB)
+        with st.expander("Model Calibration"):
+            A = decimal_input("A annealer term", st.session_state["A_param"], "wd_A", min_value=1e-12, max_value=1.0)
+            B = decimal_input("B oven term",     st.session_state["B_param"], "wd_B", min_value=1e-12, max_value=1.0)
+
+            colsE = st.columns(2)
+            if colsE[0].button("Fit A and B from history", use_container_width=True):
+                fitted = fit_A_B_from_history(st.session_state["kA_param"], st.session_state["kB_param"],
+                                              st.session_state["TrefA_param"], st.session_state["TrefB_param"])
+                if fitted is None:
+                    st.warning("Not enough complete rows with actual final and oven fields.")
+                else:
+                    a_hat, b_hat, rmse, n = fitted
+                    st.session_state["A_param"] = a_hat
+                    st.session_state["B_param"] = b_hat
+                    st.session_state["wd_A"] = str(a_hat)
+                    st.session_state["wd_B"] = str(b_hat)
+                    st.success(f"Fitted A={a_hat:.6e}  B={b_hat:.6e}  RMSE={rmse:.6f} in  using n={n}")
+            if colsE[1].button("Set current as defaults", use_container_width=True):
+                st.session_state["A_param"] = float(A)
+                st.session_state["B_param"] = float(B)
+                st.success("Session defaults updated.")
+
+        with st.expander("Temperature Sensitivity Settings"):
+            kA = decimal_input("kA per °F", st.session_state["kA_param"], "wd_kA", min_value=-0.01, max_value=0.01)
+            kB = decimal_input("kB per °F", st.session_state["kB_param"], "wd_kB", min_value=-0.01, max_value=0.01)
+            TrefA = decimal_input("TrefA °F", st.session_state["TrefA_param"], "wd_TrefA", min_value=300.0, max_value=1100.0)
+            TrefB = decimal_input("TrefB °F", st.session_state["TrefB_param"], "wd_TrefB", min_value=200.0, max_value=1100.0)
+
+        cols = st.columns(3)
+        do_predict = cols[0].button("Predict Final Diameter", use_container_width=True)
+        do_save = cols[1].button("Save Run", type="secondary", use_container_width=True)
+        cols[2].toggle(
+            "Residual learning", key="use_residual_learning",
+            help="Use history file to correct bias with nearest neighbors"
         )
-        row = {
-            "date_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "starting_diameter_in": start_dia_in,
-            "passes": passes,
-            "line_speed_fpm": line_speed_fpm,
-            "oven_hot_length_ft": oven_hot_length_ft,
-            "oven_top_F": oven_top_F,
-            "oven_mid_F": oven_mid_F,
-            "oven_bot_F": oven_bot_F,
-            "annealer_height_ft": annealer_height_ft,
-            "annealer_temp_F": annealer_temp_F,
-            "payoff_type": payoff_type,
-            "payoff_tension_lb": payoff_tension_lb,
-            "pred_final_od_in": final_d,
-            "actual_final_od_in": known_actual if known_actual else "",
-            "A_used": A,
-            "B_used": B,
-            "kA_used": kA,
-            "kB_used": kB,
-            "notes": notes,
-        }
-        ok = save_row(WIRE_FILE, WIRE_LOCAL, WIRE_COLS, row, "Add wire diameter run")
-        if ok:
-            st.success("Run saved to history.")
+
+        st.markdown("**Reverse Calculator**")
+        target_final = decimal_input(
+            "Desired Final Diameter in",
+            0.04100,
+            "wd_target",
+            min_value=0.001,
+            max_value=0.200,
+            help="Compute required start diameter for the inputs above",
+        )
+        do_reverse = st.button("Compute Required Start Diameter", use_container_width=True, key="wd_reverse")
+    with right:
+        st.markdown("**Known Actual for this run optional**")
+        wd_actual = decimal_input("Actual Final OD in", "", "wd_actual", min_value=0.0, max_value=1.0)
+
+        st.markdown("**Recent history**")
+        hist_df = _history_df()
+        if hist_df is not None and len(hist_df) > 0:
+            show_cols = [
+                "date_time",
+                "starting_diameter_in","passes","line_speed_fpm",
+                "oven_hot_length_ft","oven_top_F","oven_mid_F","oven_bot_F",
+                "annealer_height_ft","annealer_temp_F",
+                "payoff_type","payoff_tension_lb",
+                "pred_final_od_in","actual_final_od_in",
+                "A_used","B_used"
+            ]
+            keep = [c for c in show_cols if c in hist_df.columns]
+            st.dataframe(hist_df.tail(15)[keep], use_container_width=True, height=420)
         else:
-            st.error("Run save failed.")
+            st.info("No history yet in wire_diameter_runs.csv")
 
-    st.markdown("---")
+    if do_predict:
+        req = (d0, passes, speed, oven_len, topF, midF, botF, annealer_ht, anneal_temp, payoff_tension, A, B)
+        if None in req:
+            missing = []
+            names = ["Starting Diameter", "Passes", "Line Speed", "Heated Length", "Zone 3", "Zone 2", "Zone 1",
+                     "Annealer Height", "Annealer Temp", "Payoff Tension", "A", "B"]
+            for val, nm in zip(req, names):
+                if val is None:
+                    missing.append(nm)
+            st.error(f"Please complete: {', '.join(missing)}")
+        else:
+            try:
+                pred, dA, dB, sigma, dwell_ann, dwell_ov, phiA, phiB, Tavg = predict_final_and_parts(
+                    d0, passes, speed, oven_len, topF, midF, botF,
+                    annealer_ht, anneal_temp, payoff_type, payoff_tension,
+                    float(A), float(B), float(st.session_state.get("wd_kA", st.session_state["kA_param"]) or 0.0),
+                    float(st.session_state.get("wd_kB", st.session_state["kB_param"]) or 0.0),
+                    float(st.session_state.get("wd_TrefA", st.session_state["TrefA_param"]) or 700.0),
+                    float(st.session_state.get("wd_TrefB", st.session_state["TrefB_param"]) or 500.0),
+                )
+                correction, n_neigh = 0.0, 0
+                if st.session_state.get("use_residual_learning", False):
+                    correction, n_neigh = residual_correction_from_history(
+                        d0, passes, speed, oven_len, topF, midF, botF,
+                        annealer_ht, anneal_temp, payoff_tension, payoff_type,
+                        float(A), float(B),
+                        float(st.session_state.get("wd_kA", st.session_state["kA_param"]) or 0.0),
+                        float(st.session_state.get("wd_kB", st.session_state["kB_param"]) or 0.0),
+                        float(st.session_state.get("wd_TrefA", st.session_state["TrefA_param"]) or 700.0),
+                        float(st.session_state.get("wd_TrefB", st.session_state["TrefB_param"]) or 500.0),
+                    )
+                    pred = float(np.clip(pred + correction, 0.0, 1.0))
 
-    hist = _history_df()
-    if hist is not None and not hist.empty:
-        st.subheader("Recent History")
-        st.dataframe(hist.tail(20), use_container_width=True)
-    else:
-        st.info("No history available yet.")
+                st.subheader("Prediction")
+                st.metric("Predicted Final Diameter", f"{pred:.5f} in")
+                a, b, c = st.columns(3)
+                a.metric("Annealer stretch A once", f"{dA:.6f} in")
+                b.metric("Oven stretch B total", f"{dB:.6f} in")
+                c.metric("Total stretch", f"{(dA+dB):.6f} in")
 
+                a, b, c = st.columns(3)
+                a.metric("Stress sigma", f"{sigma:,.0f} psi")
+                b.metric("Ann dwell", f"{dwell_ann:.1f} s")
+                c.metric("Oven dwell", f"{dwell_ov:.1f} s")
+                st.caption(f"phiA={phiA:.3f} at {anneal_temp:.0f} °F  phiB={phiB:.3f} at Tavg {Tavg:.0f} °F")
+                if st.session_state.get("use_residual_learning", False):
+                    st.caption(f"Residual correction {correction:+.5f} in from {n_neigh} neighbors.")
+            except Exception as e:
+                st.error(f"Prediction failed  {e}")
+
+    if do_reverse:
+        req = (target_final, speed, oven_len, topF, midF, botF, annealer_ht, anneal_temp, payoff_tension, A, B)
+        if None in req:
+            missing = []
+            names = ["Desired Final", "Line Speed", "Heated Length", "Zone 3", "Zone 2", "Zone 1",
+                     "Annealer Height", "Annealer Temp", "Payoff Tension", "A", "B"]
+            for val, nm in zip(req, names):
+                if val is None:
+                    missing.append(nm)
+            st.error(f"Please complete: {', '.join(missing)}")
+        else:
+            try:
+                required_start = reverse_required_start(
+                    target_final, passes, speed, oven_len, topF, midF, botF,
+                    annealer_ht, anneal_temp, payoff_type, payoff_tension,
+                    float(A), float(B),
+                    float(st.session_state.get("wd_kA", st.session_state["kA_param"]) or 0.0),
+                    float(st.session_state.get("wd_kB", st.session_state["kB_param"]) or 0.0),
+                    float(st.session_state.get("wd_TrefA", st.session_state["TrefA_param"]) or 700.0),
+                    float(st.session_state.get("wd_TrefB", st.session_state["TrefB_param"]) or 500.0),
+                )
+                st.subheader("Reverse Calculator")
+                r1, r2 = st.columns(2)
+                r1.metric("Required Start Diameter", f"{required_start:.5f} in")
+                r2.metric("Delta Start minus Final", f"{(required_start - target_final):.5f} in")
+            except Exception as e:
+                st.error(f"Reverse calculation failed  {e}")
+
+    if do_save:
+        req = (d0, passes, speed, oven_len, topF, midF, botF, annealer_ht, anneal_temp, payoff_tension, A, B)
+        if None in req:
+            st.error("Please complete all inputs before saving.")
+        else:
+            try:
+                kA = float(st.session_state.get("wd_kA", st.session_state["kA_param"]) or 0.0)
+                kB = float(st.session_state.get("wd_kB", st.session_state["kB_param"]) or 0.0)
+                TrefA = float(st.session_state.get("wd_TrefA", st.session_state["TrefA_param"]) or 700.0)
+                TrefB = float(st.session_state.get("wd_TrefB", st.session_state["TrefB_param"]) or 500.0)
+                pred, dA, dB, *_ = predict_final_and_parts(
+                    d0, passes, speed, oven_len, topF, midF, botF,
+                    annealer_ht, anneal_temp, payoff_type, payoff_tension,
+                    float(A), float(B), kA, kB, TrefA, TrefB
+                )
+                row = {
+                    "date_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "starting_diameter_in": float(d0),
+                    "passes": int(passes),
+                    "line_speed_fpm": float(speed),
+                    "oven_hot_length_ft": float(oven_len),
+                    "oven_top_F": float(topF),
+                    "oven_mid_F": float(midF),
+                    "oven_bot_F": float(botF),
+                    "annealer_height_ft": float(annealer_ht),
+                    "annealer_temp_F": float(anneal_temp),
+                    "payoff_type": payoff_type,
+                    "payoff_tension_lb": float(payoff_tension),
+                    "pred_final_od_in": float(pred),
+                    "actual_final_od_in": float(wd_actual) if wd_actual not in (None, "") else "",
+                    "A_used": float(A),
+                    "B_used": float(B),
+                    "kA_used": float(kA),
+                    "kB_used": float(kB),
+                    "notes": "",
+                }
+                ok = save_row(WIRE_FILE, WIRE_LOCAL, WIRE_COLS, row, "append wire diameter run")
+                if ok:
+                    st.success("Saved run to wire_diameter_runs.csv")
+                else:
+                    st.error("Save failed")
+            except Exception as e:
+                st.error(f"Save failed  {e}")
 # =========================================================
 # RUNTIME CALCULATOR PAGE
 # =========================================================
@@ -533,7 +712,6 @@ def runtime_calculator_page():
         b.metric("Hourly Output", f"{hr_out:,.0f} ft hr")
         c.metric("Daily Output", f"{day_out:,.0f} ft day")
     st.markdown("Typical line speeds   Fine less than 0.010 in 15 to 25 FPM   0.010 to 0.050 in 12 to 20 FPM   Larger than 0.050 in 8 to 15 FPM.")
-
 # =========================================================
 # COPPER WIRE CONVERTER PAGE
 # =========================================================
@@ -577,7 +755,6 @@ def copper_wire_converter_page():
             st.subheader("Results")
             st.metric("Estimated Length", f"{feet:,.0f} ft")
             st.caption(f"Linear Density {(pounds/feet) if feet>0 else 0:.5f} lb per ft")
-
 # =========================================================
 # COATED COPPER CONVERTER PAGE
 # =========================================================
@@ -624,7 +801,6 @@ def coated_copper_converter_page():
             st.metric("Linear Density", f"{lin_den_lb_per_ft:,.5f} lb per ft")
             st.metric("Net Wire Weight", f"{net_lb:,.3f} lb")
             st.metric("Estimated Length", f"{feet:,.0f} ft")
-
 # =========================================================
 # PAA USAGE PAGE
 # =========================================================
@@ -696,7 +872,6 @@ def paa_usage_page():
         a.metric("Hold up Mass", f"{hold_up_mass_lb:,.3f} lb")
         b.metric("Heel Mass", f"{heel_mass_lb:,.3f} lb")
         c.metric("Total with Allowance", f"{total_with_allowance_lb:,.4f} lb")
-
 # =========================================================
 # ANNEAL TEMP ESTIMATOR PAGE
 # =========================================================
@@ -772,7 +947,6 @@ def anneal_temp_estimator_page():
         weight_method = st.selectbox("Weighting Method", ["Gaussian", "Distance", "Uniform"], index=0)
     with m4:
         oor_gate = st.slider("Out of Range Gate p75 dist z space", min_value=0.5, max_value=3.0, value=1.25, step=0.05)
-
     if st.button("Predict Temperature", key="anneal_predict"):
         if None in (wire_dia, speed, height):
             st.error("Please fill all inputs.")
@@ -900,7 +1074,6 @@ def anneal_temp_estimator_page():
                     'Dwell s': '{:.1f}', 'Temp °F': '{:.0f}', 'Distance': '{:.3f}', 'Weight': '{:.3f}'
                 })
             )
-
 # =========================================================
 # MAIN APP
 # =========================================================
@@ -936,11 +1109,13 @@ def main():
     st.sidebar.info("""
 Zeus Polyimide Process Suite
 
-• Wire Diameter Predictor revised with auto calibration, reset, and history saving
-• Runtime calculator for job planning
-• Copper and coated copper converters
-• PAA usage estimator
-• Anneal temp estimator with advanced kNN backbone
+• Wire Diameter Predictor now uses a two term model
+  A once for the vertical annealer
+  B per pass for oven creep
+  Both scale with stress dwell and temperature
+• Reverse calculator solves for start OD with an iterative method
+• Optional residual learning uses nearest neighbors from the history file
+• History saves to wire_diameter_runs.csv with all thermal and tension fields
     """)
 
 if __name__ == "__main__":
