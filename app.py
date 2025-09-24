@@ -104,7 +104,7 @@ def _gh_api_url(path: str) -> str:
 def _gh_raw_url(path: str) -> str:
     return f"https://raw.githubusercontent.com/{GH_OWNER}/{GH_REPO}/{GH_BRANCH}/{path}"
 
-def _gh_get_sha(path: str) -> str | None:
+def _gh_get_sha(path: str):
     if not GH_TOKEN:
         return None
     r = requests.get(_gh_api_url(path), headers={"Authorization": f"token {GH_TOKEN}"})
@@ -143,12 +143,16 @@ def load_csv(path: str, local_fallback: Path, required_cols: list[str]) -> pd.Da
     try:
         if GH_OWNER and GH_REPO:
             df = pd.read_csv(_gh_raw_url(path), na_values=["", " ", "NA", "N/A", "None", "null"])
-            if set(required_cols).issubset(df.columns):
-                return df
+            for col in required_cols:
+                if col not in df.columns:
+                    df[col] = ""
+            return df
         if local_fallback.exists():
             df = pd.read_csv(local_fallback, na_values=["", " ", "NA", "N/A", "None", "null"])
-            if set(required_cols).issubset(df.columns):
-                return df
+            for col in required_cols:
+                if col not in df.columns:
+                    df[col] = ""
+            return df
     except Exception:
         return None
     return None
@@ -463,10 +467,11 @@ def wire_diameter_predictor_page():
         speed = decimal_input("Line Speed FPM", 18.0, "wd_speed", min_value=1.0, max_value=100.0)
 
         st.markdown("**Thermal hardware**")
-        oven_len = decimal_input("Oven Hot Length per pass ft", 12.0, "wd_ovlen", min_value=1.0, max_value=60.0)
-        topF = decimal_input("Oven Top °F", 300.0, "wd_top", min_value=200.0, max_value=1200.0)
-        midF = decimal_input("Oven Mid °F", 550.0, "wd_mid", min_value=200.0, max_value=1200.0)
-        botF = decimal_input("Oven Bottom °F", 700.0, "wd_bot", min_value=200.0, max_value=1200.0)
+        oven_len = decimal_input("Heated Length per Pass ft", 12.0, "wd_ovlen", min_value=1.0, max_value=60.0)
+        # Zone rename in UI only. Internal variables keep top mid bot for CSV compatibility
+        topF = decimal_input("Zone 3 Top Hottest °F", 300.0, "wd_top", min_value=200.0, max_value=1200.0)
+        midF = decimal_input("Zone 2 Middle °F", 550.0, "wd_mid", min_value=200.0, max_value=1200.0)
+        botF = decimal_input("Zone 1 Bottom °F", 700.0, "wd_bot", min_value=200.0, max_value=1200.0)
 
         annealer_ht = decimal_input("Annealer Height ft", 14.0, "wd_ht", min_value=1.0, max_value=50.0)
         anneal_temp = decimal_input("Annealer Temp °F", 825.0, "wd_temp", min_value=400.0, max_value=1200.0)
@@ -482,19 +487,14 @@ def wire_diameter_predictor_page():
             help="Large 0 to 4 lbf     22 inch 0 to 15 lbf",
         )
 
-        st.markdown("**Model parameters**")
-        A = decimal_input("A annealer term", st.session_state["A_param"], "wd_A", min_value=1e-12, max_value=1.0)
-        B = decimal_input("B oven term",     st.session_state["B_param"], "wd_B", min_value=1e-12, max_value=1.0)
-
-        with st.expander("Expert temperature sensitivity"):
-            kA = decimal_input("kA per °F", st.session_state["kA_param"], "wd_kA", min_value=-0.01, max_value=0.01)
-            kB = decimal_input("kB per °F", st.session_state["kB_param"], "wd_kB", min_value=-0.01, max_value=0.01)
-            TrefA = decimal_input("TrefA °F", st.session_state["TrefA_param"], "wd_TrefA", min_value=300.0, max_value=1100.0)
-            TrefB = decimal_input("TrefB °F", st.session_state["TrefB_param"], "wd_TrefB", min_value=200.0, max_value=1100.0)
+        with st.expander("Model Calibration"):
+            A = decimal_input("A annealer term", st.session_state["A_param"], "wd_A", min_value=1e-12, max_value=1.0)
+            B = decimal_input("B oven term",     st.session_state["B_param"], "wd_B", min_value=1e-12, max_value=1.0)
 
             colsE = st.columns(2)
             if colsE[0].button("Fit A and B from history", use_container_width=True):
-                fitted = fit_A_B_from_history(kA, kB, TrefA, TrefB)
+                fitted = fit_A_B_from_history(st.session_state["kA_param"], st.session_state["kB_param"],
+                                              st.session_state["TrefA_param"], st.session_state["TrefB_param"])
                 if fitted is None:
                     st.warning("Not enough complete rows with actual final and oven fields.")
                 else:
@@ -507,16 +507,18 @@ def wire_diameter_predictor_page():
             if colsE[1].button("Set current as defaults", use_container_width=True):
                 st.session_state["A_param"] = float(A)
                 st.session_state["B_param"] = float(B)
-                st.session_state["kA_param"] = float(kA)
-                st.session_state["kB_param"] = float(kB)
-                st.session_state["TrefA_param"] = float(TrefA)
-                st.session_state["TrefB_param"] = float(TrefB)
                 st.success("Session defaults updated.")
+
+        with st.expander("Temperature Sensitivity Settings"):
+            kA = decimal_input("kA per °F", st.session_state["kA_param"], "wd_kA", min_value=-0.01, max_value=0.01)
+            kB = decimal_input("kB per °F", st.session_state["kB_param"], "wd_kB", min_value=-0.01, max_value=0.01)
+            TrefA = decimal_input("TrefA °F", st.session_state["TrefA_param"], "wd_TrefA", min_value=300.0, max_value=1100.0)
+            TrefB = decimal_input("TrefB °F", st.session_state["TrefB_param"], "wd_TrefB", min_value=200.0, max_value=1100.0)
 
         cols = st.columns(3)
         do_predict = cols[0].button("Predict Final Diameter", use_container_width=True)
         do_save = cols[1].button("Save Run", type="secondary", use_container_width=True)
-        do_toggle_resid = cols[2].toggle(
+        cols[2].toggle(
             "Residual learning", key="use_residual_learning",
             help="Use history file to correct bias with nearest neighbors"
         )
@@ -551,26 +553,38 @@ def wire_diameter_predictor_page():
             keep = [c for c in show_cols if c in hist_df.columns]
             st.dataframe(hist_df.tail(15)[keep], use_container_width=True, height=420)
         else:
-            st.info("No history yet wire_diameter_runs.csv")
+            st.info("No history yet in wire_diameter_runs.csv")
 
-    # Predict forward
     if do_predict:
         req = (d0, passes, speed, oven_len, topF, midF, botF, annealer_ht, anneal_temp, payoff_tension, A, B)
         if None in req:
-            st.error("Please complete all inputs.")
+            missing = []
+            names = ["Starting Diameter", "Passes", "Line Speed", "Heated Length", "Zone 3", "Zone 2", "Zone 1",
+                     "Annealer Height", "Annealer Temp", "Payoff Tension", "A", "B"]
+            for val, nm in zip(req, names):
+                if val is None:
+                    missing.append(nm)
+            st.error(f"Please complete: {', '.join(missing)}")
         else:
             try:
                 pred, dA, dB, sigma, dwell_ann, dwell_ov, phiA, phiB, Tavg = predict_final_and_parts(
                     d0, passes, speed, oven_len, topF, midF, botF,
                     annealer_ht, anneal_temp, payoff_type, payoff_tension,
-                    A, B, kA, kB, TrefA, TrefB
+                    float(A), float(B), float(st.session_state.get("wd_kA", st.session_state["kA_param"]) or 0.0),
+                    float(st.session_state.get("wd_kB", st.session_state["kB_param"]) or 0.0),
+                    float(st.session_state.get("wd_TrefA", st.session_state["TrefA_param"]) or 700.0),
+                    float(st.session_state.get("wd_TrefB", st.session_state["TrefB_param"]) or 500.0),
                 )
                 correction, n_neigh = 0.0, 0
                 if st.session_state.get("use_residual_learning", False):
                     correction, n_neigh = residual_correction_from_history(
                         d0, passes, speed, oven_len, topF, midF, botF,
                         annealer_ht, anneal_temp, payoff_tension, payoff_type,
-                        A, B, kA, kB, TrefA, TrefB
+                        float(A), float(B),
+                        float(st.session_state.get("wd_kA", st.session_state["kA_param"]) or 0.0),
+                        float(st.session_state.get("wd_kB", st.session_state["kB_param"]) or 0.0),
+                        float(st.session_state.get("wd_TrefA", st.session_state["TrefA_param"]) or 700.0),
+                        float(st.session_state.get("wd_TrefB", st.session_state["TrefB_param"]) or 500.0),
                     )
                     pred = float(np.clip(pred + correction, 0.0, 1.0))
 
@@ -591,17 +605,26 @@ def wire_diameter_predictor_page():
             except Exception as e:
                 st.error(f"Prediction failed  {e}")
 
-    # Reverse calculator
     if do_reverse:
         req = (target_final, speed, oven_len, topF, midF, botF, annealer_ht, anneal_temp, payoff_tension, A, B)
         if None in req:
-            st.error("Please complete inputs above and desired final diameter.")
+            missing = []
+            names = ["Desired Final", "Line Speed", "Heated Length", "Zone 3", "Zone 2", "Zone 1",
+                     "Annealer Height", "Annealer Temp", "Payoff Tension", "A", "B"]
+            for val, nm in zip(req, names):
+                if val is None:
+                    missing.append(nm)
+            st.error(f"Please complete: {', '.join(missing)}")
         else:
             try:
                 required_start = reverse_required_start(
                     target_final, passes, speed, oven_len, topF, midF, botF,
                     annealer_ht, anneal_temp, payoff_type, payoff_tension,
-                    A, B, kA, kB, TrefA, TrefB
+                    float(A), float(B),
+                    float(st.session_state.get("wd_kA", st.session_state["kA_param"]) or 0.0),
+                    float(st.session_state.get("wd_kB", st.session_state["kB_param"]) or 0.0),
+                    float(st.session_state.get("wd_TrefA", st.session_state["TrefA_param"]) or 700.0),
+                    float(st.session_state.get("wd_TrefB", st.session_state["TrefB_param"]) or 500.0),
                 )
                 st.subheader("Reverse Calculator")
                 r1, r2 = st.columns(2)
@@ -610,17 +633,20 @@ def wire_diameter_predictor_page():
             except Exception as e:
                 st.error(f"Reverse calculation failed  {e}")
 
-    # Save
     if do_save:
         req = (d0, passes, speed, oven_len, topF, midF, botF, annealer_ht, anneal_temp, payoff_tension, A, B)
         if None in req:
             st.error("Please complete all inputs before saving.")
         else:
             try:
+                kA = float(st.session_state.get("wd_kA", st.session_state["kA_param"]) or 0.0)
+                kB = float(st.session_state.get("wd_kB", st.session_state["kB_param"]) or 0.0)
+                TrefA = float(st.session_state.get("wd_TrefA", st.session_state["TrefA_param"]) or 700.0)
+                TrefB = float(st.session_state.get("wd_TrefB", st.session_state["TrefB_param"]) or 500.0)
                 pred, dA, dB, *_ = predict_final_and_parts(
                     d0, passes, speed, oven_len, topF, midF, botF,
                     annealer_ht, anneal_temp, payoff_type, payoff_tension,
-                    A, B, kA, kB, TrefA, TrefB
+                    float(A), float(B), kA, kB, TrefA, TrefB
                 )
                 row = {
                     "date_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
