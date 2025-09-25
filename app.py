@@ -13,6 +13,8 @@ import requests
 from sklearn.neighbors import NearestNeighbors
 from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LinearRegression
+import plotly.express as px
+import plotly.graph_objects as go
 
 st.set_page_config(
     page_title="Zeus Polyimide Process Suite",
@@ -177,6 +179,7 @@ def save_row(path: str, local_fallback: Path, cols: list[str], row: dict, commit
         st.warning("Remote save to GitHub did not confirm. Local file was written.")
 
     return local_ok or remote_ok
+
 # =========================================================
 # WIRE DIAMETER PREDICTOR
 # =========================================================
@@ -306,6 +309,7 @@ def reverse_required_start(
             break
         d0 = max(d0 + 0.8 * err, target_final_in)
     return d0
+
 def _history_df() -> pd.DataFrame | None:
     return load_csv(WIRE_FILE, WIRE_LOCAL, WIRE_COLS)
 
@@ -598,6 +602,34 @@ def wire_diameter_predictor_page():
                 st.caption(f"phiA={phiA:.3f} at {anneal_temp:.0f} °F  phiB={phiB:.3f} at Tavg {Tavg:.0f} °F")
                 if st.session_state.get("use_residual_learning", False):
                     st.caption(f"Residual correction {correction:+.5f} in from {n_neigh} neighbors.")
+
+                # Plotly visualization of predicted vs actual from history
+                hist_all = _history_df()
+                if hist_all is not None and {"actual_final_od_in", "pred_final_od_in"}.issubset(set(hist_all.columns)):
+                    valid = hist_all.dropna(subset=["actual_final_od_in", "pred_final_od_in"]).copy()
+                    valid = valid[(valid["actual_final_od_in"] != "") & (valid["pred_final_od_in"] != "")]
+                    if len(valid) >= 5:
+                        valid["actual_final_od_in"] = valid["actual_final_od_in"].astype(float)
+                        valid["pred_final_od_in"] = valid["pred_final_od_in"].astype(float)
+                        fig = px.scatter(
+                            valid,
+                            x="pred_final_od_in",
+                            y="actual_final_od_in",
+                            title="Predicted vs Actual Final OD",
+                            labels={"pred_final_od_in": "Predicted OD in", "actual_final_od_in": "Actual OD in"},
+                            hover_data=["starting_diameter_in","passes","line_speed_fpm","annealer_temp_F","payoff_tension_lb"]
+                        )
+                        minv = float(min(valid["pred_final_od_in"].min(), valid["actual_final_od_in"].min()))
+                        maxv = float(max(valid["pred_final_od_in"].max(), valid["actual_final_od_in"].max()))
+                        fig.add_trace(go.Scatter(x=[minv, maxv], y=[minv, maxv],
+                                                 mode="lines", name="y = x", line=dict(dash="dash")))
+                        st.plotly_chart(fig, use_container_width=True)
+
+                        # Residual histogram
+                        resid = valid["actual_final_od_in"] - valid["pred_final_od_in"]
+                        fig_h = px.histogram(resid, nbins=20, title="Residuals Actual minus Predicted")
+                        st.plotly_chart(fig_h, use_container_width=True)
+
             except Exception as e:
                 st.error(f"Prediction failed  {e}")
 
@@ -672,6 +704,7 @@ def wire_diameter_predictor_page():
                     st.error("Save failed")
             except Exception as e:
                 st.error(f"Save failed  {e}")
+
 # =========================================================
 # RUNTIME CALCULATOR PAGE
 # =========================================================
@@ -712,6 +745,7 @@ def runtime_calculator_page():
         b.metric("Hourly Output", f"{hr_out:,.0f} ft hr")
         c.metric("Daily Output", f"{day_out:,.0f} ft day")
     st.markdown("Typical line speeds   Fine less than 0.010 in 15 to 25 FPM   0.010 to 0.050 in 12 to 20 FPM   Larger than 0.050 in 8 to 15 FPM.")
+
 # =========================================================
 # COPPER WIRE CONVERTER PAGE
 # =========================================================
@@ -755,6 +789,7 @@ def copper_wire_converter_page():
             st.subheader("Results")
             st.metric("Estimated Length", f"{feet:,.0f} ft")
             st.caption(f"Linear Density {(pounds/feet) if feet>0 else 0:.5f} lb per ft")
+
 # =========================================================
 # COATED COPPER CONVERTER PAGE
 # =========================================================
@@ -801,6 +836,7 @@ def coated_copper_converter_page():
             st.metric("Linear Density", f"{lin_den_lb_per_ft:,.5f} lb per ft")
             st.metric("Net Wire Weight", f"{net_lb:,.3f} lb")
             st.metric("Estimated Length", f"{feet:,.0f} ft")
+
 # =========================================================
 # PAA USAGE PAGE
 # =========================================================
@@ -872,6 +908,7 @@ def paa_usage_page():
         a.metric("Hold up Mass", f"{hold_up_mass_lb:,.3f} lb")
         b.metric("Heel Mass", f"{heel_mass_lb:,.3f} lb")
         c.metric("Total with Allowance", f"{total_with_allowance_lb:,.4f} lb")
+
 # =========================================================
 # ANNEAL TEMP ESTIMATOR PAGE
 # =========================================================
@@ -947,6 +984,7 @@ def anneal_temp_estimator_page():
         weight_method = st.selectbox("Weighting Method", ["Gaussian", "Distance", "Uniform"], index=0)
     with m4:
         oor_gate = st.slider("Out of Range Gate p75 dist z space", min_value=0.5, max_value=3.0, value=1.25, step=0.05)
+
     if st.button("Predict Temperature", key="anneal_predict"):
         if None in (wire_dia, speed, height):
             st.error("Please fill all inputs.")
@@ -1018,7 +1056,9 @@ def anneal_temp_estimator_page():
             return None
 
         T_iso = isotonic_predict(q_raw[0], -q_raw[1])
-        if T_iso is None:
+        if T_iso is not None:
+            T_local = 0.7 * T_iso + 0.3 * T_knn
+        else:
             x_local_raw = X[I, 1]
             y_local = neigh_temps
             if np.unique(x_local_raw).size >= 3:
@@ -1026,11 +1066,9 @@ def anneal_temp_estimator_page():
                 ir = IsotonicRegression(increasing=True, out_of_bounds='clip')
                 ir.fit(x_local_raw[order], y_local[order])
                 T_iso = float(ir.predict([q_raw[1]])[0])
-
-        if T_iso is not None:
-            T_local = 0.7 * T_iso + 0.3 * T_knn
-        else:
-            T_local = T_knn
+                T_local = 0.7 * T_iso + 0.3 * T_knn
+            else:
+                T_local = T_knn
 
         w_local = 0.90 if not out_of_range else 0.70
         T_mix = w_local * T_local + (1.0 - w_local) * T_ridge
@@ -1060,20 +1098,28 @@ def anneal_temp_estimator_page():
         except Exception:
             st.caption("Uncertainty metrics unavailable for this query.")
 
-        with st.expander("Closest Historical Runs"):
-            neighbor_display = clean_df.iloc[I][['wire_dia_in', 'speed_fpm', 'annealer_ht_ft', 'dwell_s', 'anneal_temp_f']].copy()
-            neighbor_display['Distance'] = D
-            neighbor_display['Weight'] = w
-            neighbor_display = neighbor_display.rename(columns={
-                'wire_dia_in': 'Dia in', 'speed_fpm': 'Speed FPM', 'annealer_ht_ft': 'Height ft',
-                'dwell_s': 'Dwell s', 'anneal_temp_f': 'Temp °F'
-            })
-            st.dataframe(
-                neighbor_display.style.format({
-                    'Dia in': '{:.4f}', 'Speed FPM': '{:.1f}', 'Height ft': '{:.0f}',
-                    'Dwell s': '{:.1f}', 'Temp °F': '{:.0f}', 'Distance': '{:.3f}', 'Weight': '{:.3f}'
-                })
+        # Plotly visualization of historical data with query highlighted
+        fig2 = px.scatter(
+            clean_df,
+            x="wire_dia_in",
+            y="anneal_temp_f",
+            color="speed_fpm",
+            size="annealer_ht_ft",
+            title="Anneal Temperature Historical Data",
+            labels={"wire_dia_in": "Wire Diameter in", "anneal_temp_f": "Anneal Temp °F"},
+            hover_data=["speed_fpm", "annealer_ht_ft", "dwell_s"]
+        )
+        fig2.add_trace(
+            go.Scatter(
+                x=[wire_dia],
+                y=[T_final],
+                mode="markers",
+                marker=dict(symbol="x", size=12, color="red"),
+                name="Query Prediction"
             )
+        )
+        st.plotly_chart(fig2, use_container_width=True)
+
 # =========================================================
 # MAIN APP
 # =========================================================
