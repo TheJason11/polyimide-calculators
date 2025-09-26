@@ -1105,6 +1105,7 @@ def anneal_temp_estimator_page():
             y="anneal_temp_f",
             color="speed_fpm",
             size="annealer_ht_ft",
+            size_max=6,
             title="Anneal Temperature Historical Data",
             labels={"wire_dia_in": "Wire Diameter in", "anneal_temp_f": "Anneal Temp °F"},
             hover_data=["speed_fpm", "annealer_ht_ft", "dwell_s"]
